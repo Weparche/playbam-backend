@@ -1704,8 +1704,11 @@ const server = createServer(async (req, res) => {
         json(res, 404, { error: "Membership request not found" });
         return;
       }
-      if (requestRecord.status !== "pending") {
-        json(res, 409, { error: "Only pending membership requests can be reviewed" });
+      if (
+        (reviewMatch[3] === "approve" && requestRecord.status !== "pending") ||
+        (reviewMatch[3] === "reject" && requestRecord.status === "rejected")
+      ) {
+        json(res, 409, { error: "Membership request cannot be changed in the current state" });
         return;
       }
 
@@ -1789,4 +1792,3 @@ server.listen(PORT, () => {
   console.log(`Seed host token: ${DEFAULT_HOST_TOKEN}`);
   console.log("Temporary web identity headers: X-Playbam-User-Email, X-Playbam-User-Name");
 });
-
