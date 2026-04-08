@@ -129,6 +129,22 @@ db.exec(`
     FOREIGN KEY (wishlist_item_id) REFERENCES invitation_wishlist_items(id) ON DELETE CASCADE
   );
 
+  CREATE TABLE IF NOT EXISTS invitation_gift_participants (
+    id TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL,
+    invitation_id TEXT NOT NULL,
+    wishlist_item_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    participant_name TEXT NOT NULL,
+    child_name TEXT,
+    status TEXT NOT NULL CHECK (status IN ('active', 'cancelled')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (reservation_id) REFERENCES invitation_gift_reservations(id) ON DELETE CASCADE,
+    FOREIGN KEY (invitation_id) REFERENCES invitations(id) ON DELETE CASCADE,
+    FOREIGN KEY (wishlist_item_id) REFERENCES invitation_wishlist_items(id) ON DELETE CASCADE
+  );
+
   CREATE INDEX IF NOT EXISTS idx_family_children_profile_id
     ON family_children (family_profile_id);
   CREATE INDEX IF NOT EXISTS idx_membership_requests_invitation_id
@@ -143,8 +159,13 @@ db.exec(`
     ON invitation_wishlist_items (invitation_id);
   CREATE INDEX IF NOT EXISTS idx_gift_reservations_invitation_id
     ON invitation_gift_reservations (invitation_id);
+  CREATE INDEX IF NOT EXISTS idx_gift_participants_item_id
+    ON invitation_gift_participants (wishlist_item_id);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_reservations_active_item
     ON invitation_gift_reservations (wishlist_item_id)
+    WHERE status = 'active';
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_participants_active_item_user
+    ON invitation_gift_participants (wishlist_item_id, user_id)
     WHERE status = 'active';
 `);
 
@@ -879,9 +900,73 @@ function getActiveGiftReservationForItem(itemId) {
   );
 }
 
-function serializeWishlistReservation(reservation, currentUser, isHost) {
+function listActiveGiftParticipantsForItem(itemId) {
+  return db
+    .prepare(
+      `
+        SELECT id, reservation_id, invitation_id, wishlist_item_id, user_id, participant_name, child_name, status, created_at, updated_at
+        FROM invitation_gift_participants
+        WHERE wishlist_item_id = ? AND status = 'active'
+        ORDER BY created_at ASC
+      `,
+    )
+    .all(itemId);
+}
+
+function getActiveGiftParticipantForItemAndUser(itemId, userId) {
+  return (
+    db
+      .prepare(
+        `
+          SELECT id, reservation_id, invitation_id, wishlist_item_id, user_id, participant_name, child_name, status, created_at, updated_at
+          FROM invitation_gift_participants
+          WHERE wishlist_item_id = ? AND user_id = ? AND status = 'active'
+          LIMIT 1
+        `,
+      )
+      .get(itemId, userId) ?? null
+  );
+}
+
+function createGiftParticipant(reservation, userId, participantName, childName = null) {
+  const participantId = randomId("gift_participant");
+  const timestamp = nowIso();
+  db.prepare(
+    `
+      INSERT INTO invitation_gift_participants (
+        id, reservation_id, invitation_id, wishlist_item_id, user_id, participant_name, child_name, status, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+    `,
+  ).run(
+    participantId,
+    reservation.id,
+    reservation.invitation_id,
+    reservation.wishlist_item_id,
+    userId,
+    participantName,
+    childName,
+    timestamp,
+    timestamp,
+  );
+
+  return getActiveGiftParticipantForItemAndUser(reservation.wishlist_item_id, userId);
+}
+
+function cancelGiftParticipantsForReservation(reservationId) {
+  const timestamp = nowIso();
+  db.prepare(
+    `
+      UPDATE invitation_gift_participants
+      SET status = 'cancelled', updated_at = ?
+      WHERE reservation_id = ? AND status = 'active'
+    `,
+  ).run(timestamp, reservationId);
+}
+
+function serializeWishlistReservation(reservation, currentUser, isHost, participants = []) {
   if (!reservation) {
-    return { status: "available" };
+    return { status: "available", participants: [] };
   }
 
   const reservedBy = getUserSummaryById(reservation.reserved_by_user_id);
@@ -892,6 +977,14 @@ function serializeWishlistReservation(reservation, currentUser, isHost) {
     note: reservation.note,
     createdAt: reservation.created_at,
     updatedAt: reservation.updated_at,
+    participants: participants.map((participant) => ({
+      id: participant.id,
+      userId: participant.user_id,
+      name: participant.participant_name,
+      childName: participant.child_name,
+      createdAt: participant.created_at,
+      updatedAt: participant.updated_at,
+    })),
   };
 
   if (isHost) {
@@ -916,6 +1009,7 @@ function serializeWishlistReservation(reservation, currentUser, isHost) {
 
 function serializeWishlistItem(item, reservation, currentUser, isHost) {
   const addedBy = item.added_by_user_id ? getUserSummaryById(item.added_by_user_id) : null;
+  const participants = reservation ? listActiveGiftParticipantsForItem(item.id) : [];
   return {
     id: item.id,
     invitationId: item.invitation_id,
@@ -931,7 +1025,7 @@ function serializeWishlistItem(item, reservation, currentUser, isHost) {
     addedForChildName: item.added_for_child_name ?? null,
     createdAt: item.created_at,
     updatedAt: item.updated_at,
-    reservation: serializeWishlistReservation(reservation, currentUser, isHost),
+    reservation: serializeWishlistReservation(reservation, currentUser, isHost, participants),
   };
 }
 
@@ -1046,11 +1140,21 @@ function createGiftReservation(invitationId, itemId, userId, payload) {
     timestamp,
   );
 
-  return getActiveGiftReservationForItem(itemId);
+  const reservation = getActiveGiftReservationForItem(itemId);
+  const reservedBy = getUserSummaryById(userId);
+  createGiftParticipant(
+    reservation,
+    userId,
+    reservedBy?.displayName ?? "Nepoznat korisnik",
+    payload.reservedForChildName ?? null,
+  );
+
+  return reservation;
 }
 
 function cancelGiftReservation(reservation) {
   const timestamp = nowIso();
+  cancelGiftParticipantsForReservation(reservation.id);
   db.prepare(
     `
       UPDATE invitation_gift_reservations
@@ -1639,6 +1743,24 @@ const server = createServer(async (req, res) => {
           return;
         }
 
+        if (parsed.value.note === "Sudjeluje u poklonu") {
+          const existingParticipant = getActiveGiftParticipantForItemAndUser(item.id, currentUser.id);
+          if (!existingParticipant) {
+            const participantChildName =
+              parsed.value.reservedForChildName ||
+              getWishlistItemAddedForChildName(invitation.id, currentUser);
+            createGiftParticipant(
+              activeReservation,
+              currentUser.id,
+              currentUser.displayName,
+              participantChildName,
+            );
+          }
+
+          json(res, 200, { item: serializeWishlistItem(item, activeReservation, currentUser, false) });
+          return;
+        }
+
         json(res, 409, { error: "Wishlist item is already reserved" });
         return;
       }
@@ -1742,12 +1864,6 @@ const server = createServer(async (req, res) => {
       if (!invitation) return;
       if (invitation.host_user_id === currentUser.id) {
         json(res, 403, { error: "Invitation host cannot RSVP to their own invitation" });
-        return;
-      }
-
-      const membershipStatus = getMembershipStatusForUser(invitation, currentUser.id);
-      if (membershipStatus !== "approved") {
-        json(res, 403, { error: "Approved invitation membership is required before RSVP" });
         return;
       }
 
