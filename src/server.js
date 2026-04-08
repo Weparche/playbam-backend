@@ -716,6 +716,7 @@ function serializeMembershipRequest(request) {
 
   const user = getUserSummaryById(request.user_id);
   const familyProfile = getFamilyProfileWithChildren(request.user_id);
+  const rsvp = getRsvpForUser(request.invitation_id, request.user_id);
   const children = listMembershipRequestChildren(request.id).map((child) => ({
     id: child.id,
     familyProfileId: child.family_profile_id,
@@ -738,6 +739,13 @@ function serializeMembershipRequest(request) {
       ? {
           id: familyProfile.profile.id,
           parentName: familyProfile.profile.parent_name,
+        }
+      : null,
+    rsvp: rsvp
+      ? {
+          status: rsvp.status,
+          note: rsvp.note,
+          updatedAt: rsvp.updated_at,
         }
       : null,
     children,
@@ -1781,5 +1789,4 @@ server.listen(PORT, () => {
   console.log(`Seed host token: ${DEFAULT_HOST_TOKEN}`);
   console.log("Temporary web identity headers: X-Playbam-User-Email, X-Playbam-User-Name");
 });
-
 
