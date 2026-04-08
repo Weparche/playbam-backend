@@ -994,7 +994,11 @@ function serializeWishlistReservation(reservation, currentUser, isHost, particip
     };
   }
 
-  if (currentUser && reservation.reserved_by_user_id === currentUser.id) {
+  if (
+    currentUser &&
+    (reservation.reserved_by_user_id === currentUser.id ||
+      participants.some((participant) => participant.user_id === currentUser.id))
+  ) {
     return {
       status: "reserved_by_you",
       ...reservationPayload,
