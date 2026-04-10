@@ -1412,6 +1412,168 @@ function seedDemoInvitation() {
 
 seedDemoInvitation();
 
+// ---------------------------------------------------------------------------
+// Link unfurl / Open Graph metadata extraction
+// ---------------------------------------------------------------------------
+
+const UNFURL_CACHE = new Map();
+const UNFURL_CACHE_TTL_MS = 5 * 60 * 1000;
+const UNFURL_CACHE_MAX = 500;
+const UNFURL_TIMEOUT_MS = 4000;
+const UNFURL_MAX_BYTES = 50_000;
+
+const PRIVATE_IP_PATTERNS = [
+  /^127\./,
+  /^10\./,
+  /^192\.168\./,
+  /^172\.(1[6-9]|2\d|3[01])\./,
+  /^0\./,
+  /^169\.254\./,
+  /^::1$/,
+  /^fd[0-9a-f]{2}:/i,
+  /^fe80:/i,
+  /^localhost$/i,
+];
+
+function isPrivateHost(hostname) {
+  return PRIVATE_IP_PATTERNS.some((pattern) => pattern.test(hostname));
+}
+
+function pruneUnfurlCache() {
+  if (UNFURL_CACHE.size <= UNFURL_CACHE_MAX) return;
+  const entries = [...UNFURL_CACHE.entries()];
+  entries.sort((a, b) => a[1].ts - b[1].ts);
+  const toRemove = entries.length - UNFURL_CACHE_MAX;
+  for (let i = 0; i < toRemove; i++) {
+    UNFURL_CACHE.delete(entries[i][0]);
+  }
+}
+
+function extractMetaContent(html, property) {
+  const patterns = [
+    new RegExp(`<meta[^>]+property=["']${property}["'][^>]+content=["']([^"']+)["']`, "i"),
+    new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${property}["']`, "i"),
+    new RegExp(`<meta[^>]+name=["']${property}["'][^>]+content=["']([^"']+)["']`, "i"),
+    new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+name=["']${property}["']`, "i"),
+  ];
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match?.[1]) return match[1].trim();
+  }
+  return null;
+}
+
+function extractFavicon(html, baseUrl) {
+  const match = html.match(/<link[^>]+rel=["'](?:shortcut )?icon["'][^>]+href=["']([^"']+)["']/i)
+    ?? html.match(/<link[^>]+href=["']([^"']+)["'][^>]+rel=["'](?:shortcut )?icon["']/i);
+  if (!match?.[1]) {
+    try {
+      const u = new URL(baseUrl);
+      return `${u.protocol}//${u.host}/favicon.ico`;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return new URL(match[1], baseUrl).href;
+  } catch {
+    return match[1];
+  }
+}
+
+function resolveUrl(candidate, baseUrl) {
+  if (!candidate) return null;
+  try {
+    return new URL(candidate, baseUrl).href;
+  } catch {
+    return candidate.startsWith("http") ? candidate : null;
+  }
+}
+
+async function unfurlUrl(targetUrl) {
+  const cached = UNFURL_CACHE.get(targetUrl);
+  if (cached && Date.now() - cached.ts < UNFURL_CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    return { title: null, image: null, domain: null, favicon: null };
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { title: null, image: null, domain: null, favicon: null };
+  }
+
+  if (isPrivateHost(parsed.hostname)) {
+    return { title: null, image: null, domain: parsed.hostname, favicon: null };
+  }
+
+  const domain = parsed.hostname.replace(/^www\./, "");
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), UNFURL_TIMEOUT_MS);
+
+    const response = await fetch(targetUrl, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Playbam-LinkPreview/1.0",
+        Accept: "text/html, application/xhtml+xml",
+      },
+      redirect: "follow",
+    });
+
+    clearTimeout(timeout);
+
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!contentType.includes("text/html") && !contentType.includes("xhtml")) {
+      const result = { title: null, image: null, domain, favicon: `${parsed.protocol}//${parsed.host}/favicon.ico` };
+      UNFURL_CACHE.set(targetUrl, { data: result, ts: Date.now() });
+      pruneUnfurlCache();
+      return result;
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      return { title: null, image: null, domain, favicon: null };
+    }
+
+    let html = "";
+    let bytesRead = 0;
+    const decoder = new TextDecoder();
+
+    while (bytesRead < UNFURL_MAX_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      html += decoder.decode(value, { stream: true });
+      if (html.includes("</head>")) break;
+    }
+
+    reader.cancel().catch(() => {});
+
+    const ogTitle = extractMetaContent(html, "og:title");
+    const ogImage = resolveUrl(extractMetaContent(html, "og:image"), targetUrl);
+    const favicon = extractFavicon(html, targetUrl);
+
+    const titleMatch = !ogTitle ? html.match(/<title[^>]*>([^<]+)<\/title>/i) : null;
+    const title = ogTitle || titleMatch?.[1]?.trim() || null;
+
+    const result = { title, image: ogImage, domain, favicon };
+    UNFURL_CACHE.set(targetUrl, { data: result, ts: Date.now() });
+    pruneUnfurlCache();
+    return result;
+  } catch {
+    const result = { title: null, image: null, domain, favicon: null };
+    UNFURL_CACHE.set(targetUrl, { data: result, ts: Date.now() });
+    pruneUnfurlCache();
+    return result;
+  }
+}
+
 const server = createServer(async (req, res) => {
   if (!req.url || !req.method) {
     json(res, 400, { error: "Invalid request" });
@@ -1883,6 +2045,17 @@ const server = createServer(async (req, res) => {
       if (!invitation) return;
 
       json(res, 200, getInvitationAccess(invitation, resolveCurrentUser(req)));
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/unfurl") {
+      const targetUrl = url.searchParams.get("url");
+      if (!targetUrl) {
+        json(res, 200, { title: null, image: null, domain: null, favicon: null });
+        return;
+      }
+      const result = await unfurlUrl(targetUrl);
+      json(res, 200, result);
       return;
     }
 
