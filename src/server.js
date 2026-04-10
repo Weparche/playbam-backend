@@ -1574,6 +1574,85 @@ async function unfurlUrl(targetUrl) {
   }
 }
 
+const IMAGE_PROXY_TIMEOUT_MS = 5000;
+const IMAGE_PROXY_MAX_BYTES = 2 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml", "image/x-icon", "image/vnd.microsoft.icon"];
+
+async function proxyImage(targetUrl, res) {
+  let parsed;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    res.writeHead(400, { "Content-Type": "text/plain" });
+    res.end("Bad URL");
+    return;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    res.writeHead(400, { "Content-Type": "text/plain" });
+    res.end("Bad protocol");
+    return;
+  }
+  if (isPrivateHost(parsed.hostname)) {
+    res.writeHead(403, { "Content-Type": "text/plain" });
+    res.end("Forbidden");
+    return;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), IMAGE_PROXY_TIMEOUT_MS);
+
+    const upstream = await fetch(targetUrl, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Playbam-LinkPreview/1.0",
+        Accept: "image/*",
+      },
+      redirect: "follow",
+    });
+
+    clearTimeout(timeout);
+
+    if (!upstream.ok) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end("Upstream error");
+      return;
+    }
+
+    const contentType = upstream.headers.get("content-type") ?? "";
+    const isImage = ALLOWED_IMAGE_TYPES.some((t) => contentType.startsWith(t));
+    if (!isImage) {
+      res.writeHead(415, { "Content-Type": "text/plain" });
+      res.end("Not an image");
+      return;
+    }
+
+    res.writeHead(200, {
+      "Content-Type": contentType,
+      "Cache-Control": "public, max-age=86400",
+      "Access-Control-Allow-Origin": "*",
+    });
+
+    const reader = upstream.body?.getReader();
+    if (!reader) { res.end(); return; }
+
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > IMAGE_PROXY_MAX_BYTES) { reader.cancel().catch(() => {}); break; }
+      res.write(Buffer.from(value));
+    }
+    res.end();
+  } catch {
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+    }
+    res.end("Fetch failed");
+  }
+}
+
 const server = createServer(async (req, res) => {
   if (!req.url || !req.method) {
     json(res, 400, { error: "Invalid request" });
@@ -2048,19 +2127,27 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "GET" && pathname === "/api/image-proxy") {
+      const targetUrl = url.searchParams.get("url");
+      if (!targetUrl) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Missing url param");
+        return;
+      }
+      await proxyImage(targetUrl, res);
+      return;
+    }
+
     if (req.method === "GET" && pathname === "/api/unfurl") {
       const targetUrl = url.searchParams.get("url");
-      console.log("[unfurl] request for:", targetUrl);
       if (!targetUrl) {
         json(res, 200, { title: null, image: null, domain: null, favicon: null });
         return;
       }
       try {
         const result = await unfurlUrl(targetUrl);
-        console.log("[unfurl] result:", JSON.stringify(result));
         json(res, 200, result);
-      } catch (err) {
-        console.error("[unfurl] error:", err);
+      } catch {
         json(res, 200, { title: null, image: null, domain: null, favicon: null });
       }
       return;
