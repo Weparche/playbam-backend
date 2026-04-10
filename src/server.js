@@ -2050,12 +2050,19 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/unfurl") {
       const targetUrl = url.searchParams.get("url");
+      console.log("[unfurl] request for:", targetUrl);
       if (!targetUrl) {
         json(res, 200, { title: null, image: null, domain: null, favicon: null });
         return;
       }
-      const result = await unfurlUrl(targetUrl);
-      json(res, 200, result);
+      try {
+        const result = await unfurlUrl(targetUrl);
+        console.log("[unfurl] result:", JSON.stringify(result));
+        json(res, 200, result);
+      } catch (err) {
+        console.error("[unfurl] error:", err);
+        json(res, 200, { title: null, image: null, domain: null, favicon: null });
+      }
       return;
     }
 
