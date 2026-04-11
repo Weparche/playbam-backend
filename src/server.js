@@ -1419,8 +1419,8 @@ seedDemoInvitation();
 const UNFURL_CACHE = new Map();
 const UNFURL_CACHE_TTL_MS = 5 * 60 * 1000;
 const UNFURL_CACHE_MAX = 500;
-const UNFURL_TIMEOUT_MS = 4000;
-const UNFURL_MAX_BYTES = 50_000;
+const UNFURL_TIMEOUT_MS = 5000;
+const UNFURL_MAX_BYTES = 150_000;
 
 const PRIVATE_IP_PATTERNS = [
   /^127\./,
@@ -1490,6 +1490,54 @@ function resolveUrl(candidate, baseUrl) {
   }
 }
 
+function isPlausibleImageUrl(url) {
+  if (!url) return false;
+  const protocolCount = (url.match(/https?:\/\//g) || []).length;
+  if (protocolCount > 1) return false;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    if (parsed.pathname === "/" || parsed.pathname === "") return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeJsonString(raw) {
+  return raw.replace(/[\x00-\x1f\x7f]/g, " ");
+}
+
+function extractJsonLdImage(html, baseUrl) {
+  const blocks = [];
+  const re = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    try {
+      blocks.push(JSON.parse(m[1]));
+    } catch {
+      try {
+        const sanitized = sanitizeJsonString(m[1]);
+        blocks.push(JSON.parse(sanitized));
+      } catch { /* truly malformed, skip */ }
+    }
+  }
+
+  for (const block of blocks) {
+    const obj = block?.["@type"] === "Product" ? block
+      : Array.isArray(block?.["@graph"]) ? block["@graph"].find((n) => n?.["@type"] === "Product")
+      : null;
+    if (!obj) continue;
+    const images = Array.isArray(obj.image) ? obj.image : obj.image ? [obj.image] : [];
+    for (const img of images) {
+      const src = typeof img === "string" ? img : img?.url;
+      const resolved = resolveUrl(src, baseUrl);
+      if (isPlausibleImageUrl(resolved)) return resolved;
+    }
+  }
+  return null;
+}
+
 async function unfurlUrl(targetUrl) {
   const cached = UNFURL_CACHE.get(targetUrl);
   if (cached && Date.now() - cached.ts < UNFURL_CACHE_TTL_MS) {
@@ -1550,19 +1598,21 @@ async function unfurlUrl(targetUrl) {
       if (done) break;
       bytesRead += value.byteLength;
       html += decoder.decode(value, { stream: true });
-      if (html.includes("</head>")) break;
     }
 
     reader.cancel().catch(() => {});
 
     const ogTitle = extractMetaContent(html, "og:title");
-    const ogImage = resolveUrl(extractMetaContent(html, "og:image"), targetUrl);
+    const rawOgImage = resolveUrl(extractMetaContent(html, "og:image"), targetUrl);
+    const ogImage = isPlausibleImageUrl(rawOgImage) ? rawOgImage : null;
     const favicon = extractFavicon(html, targetUrl);
+    const jsonLdImage = !ogImage ? extractJsonLdImage(html, targetUrl) : null;
+    const image = ogImage || jsonLdImage || null;
 
     const titleMatch = !ogTitle ? html.match(/<title[^>]*>([^<]+)<\/title>/i) : null;
     const title = ogTitle || titleMatch?.[1]?.trim() || null;
 
-    const result = { title, image: ogImage, domain, favicon };
+    const result = { title, image, domain, favicon };
     UNFURL_CACHE.set(targetUrl, { data: result, ts: Date.now() });
     pruneUnfurlCache();
     return result;
