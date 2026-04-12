@@ -41,12 +41,18 @@ db.exec(`
     title TEXT NOT NULL,
     celebrant_name TEXT NOT NULL,
     title_font TEXT,
+    title_color TEXT,
+    title_outline TEXT,
+    title_size TEXT,
     date TEXT NOT NULL,
     time TEXT NOT NULL,
     location TEXT NOT NULL,
     message TEXT,
     cover_image TEXT,
     theme TEXT,
+    parking_location TEXT,
+    cafe_location TEXT,
+    extra_details TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (host_user_id) REFERENCES host_users(id)
@@ -182,6 +188,12 @@ function ensureColumnExists(tableName, columnName, columnDefinition) {
 ensureColumnExists("invitation_wishlist_items", "added_by_user_id", "TEXT");
 ensureColumnExists("invitation_wishlist_items", "added_for_child_name", "TEXT");
 ensureColumnExists("invitations", "title_font", "TEXT");
+ensureColumnExists("invitations", "title_color", "TEXT");
+ensureColumnExists("invitations", "title_outline", "TEXT");
+ensureColumnExists("invitations", "title_size", "TEXT");
+ensureColumnExists("invitations", "parking_location", "TEXT");
+ensureColumnExists("invitations", "cafe_location", "TEXT");
+ensureColumnExists("invitations", "extra_details", "TEXT");
 
 const DEFAULT_HOST_TOKEN = process.env.PLAYBAM_HOST_AUTH_TOKEN ?? "playbam-dev-host-token";
 const HOST_USER_ID = "host-demo-ana";
@@ -310,11 +322,35 @@ function validateCreatePayload(payload) {
   if (payload.titleFont != null && typeof payload.titleFont !== "string") {
     return "titleFont must be a string";
   }
+  if (payload.titleColor != null && typeof payload.titleColor !== "string") {
+    return "titleColor must be a string";
+  }
+  if (payload.titleOutline != null && typeof payload.titleOutline !== "string") {
+    return "titleOutline must be a string";
+  }
+  if (payload.titleSize != null && typeof payload.titleSize !== "string") {
+    return "titleSize must be a string";
+  }
   if (payload.coverImage != null && typeof payload.coverImage !== "string") {
     return "coverImage must be a string";
   }
   if (payload.theme != null && typeof payload.theme !== "string") {
     return "theme must be a string";
+  }
+  if (payload.partyDetails != null) {
+    if (typeof payload.partyDetails !== "object") {
+      return "partyDetails must be an object";
+    }
+
+    if (payload.partyDetails.parkingLocation != null && typeof payload.partyDetails.parkingLocation !== "string") {
+      return "partyDetails.parkingLocation must be a string";
+    }
+    if (payload.partyDetails.cafeLocation != null && typeof payload.partyDetails.cafeLocation !== "string") {
+      return "partyDetails.cafeLocation must be a string";
+    }
+    if (payload.partyDetails.extraDetails != null && typeof payload.partyDetails.extraDetails !== "string") {
+      return "partyDetails.extraDetails must be a string";
+    }
   }
 
   return null;
@@ -442,12 +478,20 @@ function mapInvitationRowToPublic(row) {
     title: row.title,
     celebrantName: row.celebrant_name,
     titleFont: row.title_font,
+    titleColor: row.title_color,
+    titleOutline: row.title_outline,
+    titleSize: row.title_size,
     date: row.date,
     time: row.time,
     location: row.location,
     message: row.message,
     coverImage: row.cover_image,
     theme: row.theme,
+    partyDetails: {
+      parkingLocation: row.parking_location,
+      cafeLocation: row.cafe_location,
+      extraDetails: row.extra_details,
+    },
     webShareUrl: createWebShareUrl(publicSlug),
   };
 }
@@ -575,7 +619,8 @@ function findInvitationByToken(token) {
     db
       .prepare(
         `
-          SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, date, time, location, message, cover_image, theme, created_at, updated_at
+          SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time, location, message, cover_image, theme, created_at, updated_at
+          , parking_location, cafe_location, extra_details
           FROM invitations
           WHERE share_token = ? OR public_slug = ?
         `,
@@ -589,7 +634,8 @@ function findInvitationById(invitationId) {
     db
       .prepare(
         `
-          SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, date, time, location, message, cover_image, theme, created_at, updated_at
+          SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time, location, message, cover_image, theme, created_at, updated_at
+          , parking_location, cafe_location, extra_details
           FROM invitations
           WHERE id = ?
         `,
@@ -1393,10 +1439,10 @@ function seedDemoInvitation() {
   db.prepare(
     `
       INSERT INTO invitations (
-        id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, date, time,
+        id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time,
         location, message, cover_image, theme, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
   ).run(
     invitationId,
@@ -1406,6 +1452,9 @@ function seedDemoInvitation() {
     "Luka istražuje svemir",
     "Luka",
     "lilita",
+    "playbam-blue",
+    "soft",
+    "md",
     "2026-06-15",
     "15:00",
     "Happy Land, Lastovska 2, Zagreb",
@@ -1749,10 +1798,10 @@ const server = createServer(async (req, res) => {
       db.prepare(
         `
           INSERT INTO invitations (
-            id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, date, time,
-            location, message, cover_image, theme, created_at, updated_at
+            id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time,
+            location, message, cover_image, theme, parking_location, cafe_location, extra_details, created_at, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       ).run(
         invitationId,
@@ -1762,12 +1811,18 @@ const server = createServer(async (req, res) => {
         getString(payload.title),
         getString(payload.celebrantName),
         getString(payload.titleFont) || null,
+        getString(payload.titleColor) || null,
+        getString(payload.titleOutline) || null,
+        getString(payload.titleSize) || null,
         getString(payload.date),
         getString(payload.time),
         getString(payload.location),
         getString(payload.message) || null,
         getString(payload.coverImage) || null,
         getString(payload.theme) || null,
+        getString(payload.partyDetails?.parkingLocation) || null,
+        getString(payload.partyDetails?.cafeLocation) || null,
+        getString(payload.partyDetails?.extraDetails) || null,
         timestamp,
         timestamp,
       );
@@ -1796,6 +1851,68 @@ const server = createServer(async (req, res) => {
       }
 
       json(res, 200, mapInvitationRowToPublic(invitation));
+      return;
+    }
+
+    const updateInvitationMatch = pathname.match(/^\/api\/invitations\/([^/]+)$/);
+    if (updateInvitationMatch && req.method === "PUT") {
+      const currentUser = requireCurrentUser(req, res);
+      if (!currentUser) return;
+
+      const invitation = requireInvitationById(res, decodeURIComponent(updateInvitationMatch[1]));
+      if (!invitation) return;
+      if (!requireHostAccess(res, invitation, currentUser)) return;
+
+      const payload = await readJsonBody(req);
+      const validationError = validateCreatePayload(payload);
+      if (validationError) {
+        json(res, 400, { error: validationError });
+        return;
+      }
+
+      db.prepare(
+        `
+          UPDATE invitations
+          SET
+            title = ?,
+            celebrant_name = ?,
+            title_font = ?,
+            title_color = ?,
+            title_outline = ?,
+            title_size = ?,
+            date = ?,
+            time = ?,
+            location = ?,
+            message = ?,
+            cover_image = ?,
+            theme = ?,
+            parking_location = ?,
+            cafe_location = ?,
+            extra_details = ?,
+            updated_at = ?
+          WHERE id = ?
+        `,
+      ).run(
+        getString(payload.title),
+        getString(payload.celebrantName),
+        getString(payload.titleFont) || null,
+        getString(payload.titleColor) || null,
+        getString(payload.titleOutline) || null,
+        getString(payload.titleSize) || null,
+        getString(payload.date),
+        getString(payload.time),
+        getString(payload.location),
+        getString(payload.message) || null,
+        getString(payload.coverImage) || null,
+        getString(payload.theme) || null,
+        getString(payload.partyDetails?.parkingLocation) || null,
+        getString(payload.partyDetails?.cafeLocation) || null,
+        getString(payload.partyDetails?.extraDetails) || null,
+        nowIso(),
+        invitation.id,
+      );
+
+      json(res, 200, mapInvitationRowToPublic(findInvitationById(invitation.id)));
       return;
     }
 
