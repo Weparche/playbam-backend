@@ -40,6 +40,7 @@ db.exec(`
     public_slug TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL,
     celebrant_name TEXT NOT NULL,
+    title_font TEXT,
     date TEXT NOT NULL,
     time TEXT NOT NULL,
     location TEXT NOT NULL,
@@ -180,6 +181,7 @@ function ensureColumnExists(tableName, columnName, columnDefinition) {
 
 ensureColumnExists("invitation_wishlist_items", "added_by_user_id", "TEXT");
 ensureColumnExists("invitation_wishlist_items", "added_for_child_name", "TEXT");
+ensureColumnExists("invitations", "title_font", "TEXT");
 
 const DEFAULT_HOST_TOKEN = process.env.PLAYBAM_HOST_AUTH_TOKEN ?? "playbam-dev-host-token";
 const HOST_USER_ID = "host-demo-ana";
@@ -304,6 +306,9 @@ function validateCreatePayload(payload) {
 
   if (payload.message != null && typeof payload.message !== "string") {
     return "message must be a string";
+  }
+  if (payload.titleFont != null && typeof payload.titleFont !== "string") {
+    return "titleFont must be a string";
   }
   if (payload.coverImage != null && typeof payload.coverImage !== "string") {
     return "coverImage must be a string";
@@ -436,6 +441,7 @@ function mapInvitationRowToPublic(row) {
     publicSlug,
     title: row.title,
     celebrantName: row.celebrant_name,
+    titleFont: row.title_font,
     date: row.date,
     time: row.time,
     location: row.location,
@@ -569,7 +575,7 @@ function findInvitationByToken(token) {
     db
       .prepare(
         `
-          SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, date, time, location, message, cover_image, theme, created_at, updated_at
+          SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, date, time, location, message, cover_image, theme, created_at, updated_at
           FROM invitations
           WHERE share_token = ? OR public_slug = ?
         `,
@@ -583,7 +589,7 @@ function findInvitationById(invitationId) {
     db
       .prepare(
         `
-          SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, date, time, location, message, cover_image, theme, created_at, updated_at
+          SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, date, time, location, message, cover_image, theme, created_at, updated_at
           FROM invitations
           WHERE id = ?
         `,
@@ -1387,10 +1393,10 @@ function seedDemoInvitation() {
   db.prepare(
     `
       INSERT INTO invitations (
-        id, host_user_id, share_token, public_slug, title, celebrant_name, date, time,
+        id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, date, time,
         location, message, cover_image, theme, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
   ).run(
     invitationId,
@@ -1399,6 +1405,7 @@ function seedDemoInvitation() {
     publicSlug,
     "Luka istražuje svemir",
     "Luka",
+    "lilita",
     "2026-06-15",
     "15:00",
     "Happy Land, Lastovska 2, Zagreb",
@@ -1724,7 +1731,8 @@ const server = createServer(async (req, res) => {
 
   try {
     if (req.method === "POST" && pathname === "/api/invitations") {
-      const hostUser = getHostUserByToken(getBearerToken(req)) ?? { id: HOST_USER_ID };
+      const currentHostToken = getBearerToken(req) ?? DEFAULT_HOST_TOKEN;
+      const hostUser = getHostUserByToken(currentHostToken) ?? { id: HOST_USER_ID };
 
       const payload = await readJsonBody(req);
       const validationError = validateCreatePayload(payload);
@@ -1741,10 +1749,10 @@ const server = createServer(async (req, res) => {
       db.prepare(
         `
           INSERT INTO invitations (
-            id, host_user_id, share_token, public_slug, title, celebrant_name, date, time,
+            id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, date, time,
             location, message, cover_image, theme, created_at, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       ).run(
         invitationId,
@@ -1753,6 +1761,7 @@ const server = createServer(async (req, res) => {
         publicSlug,
         getString(payload.title),
         getString(payload.celebrantName),
+        getString(payload.titleFont) || null,
         getString(payload.date),
         getString(payload.time),
         getString(payload.location),
@@ -1768,6 +1777,7 @@ const server = createServer(async (req, res) => {
         shareToken,
         publicSlug,
         webShareUrl: createWebShareUrl(publicSlug),
+        hostAuthToken: currentHostToken,
       });
       return;
     }
