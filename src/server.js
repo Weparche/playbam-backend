@@ -194,6 +194,8 @@ ensureColumnExists("invitations", "title_size", "TEXT");
 ensureColumnExists("invitations", "parking_location", "TEXT");
 ensureColumnExists("invitations", "cafe_location", "TEXT");
 ensureColumnExists("invitations", "extra_details", "TEXT");
+ensureColumnExists("invitations", "contact_name", "TEXT");
+ensureColumnExists("invitations", "contact_mobile", "TEXT");
 ensureColumnExists("invitations", "rsvp_mood", "TEXT");
 
 const DEFAULT_HOST_TOKEN = process.env.PLAYBAM_HOST_AUTH_TOKEN ?? "playbam-dev-host-token";
@@ -355,6 +357,12 @@ function validateCreatePayload(payload) {
     if (payload.partyDetails.extraDetails != null && typeof payload.partyDetails.extraDetails !== "string") {
       return "partyDetails.extraDetails must be a string";
     }
+    if (payload.partyDetails.contactName != null && typeof payload.partyDetails.contactName !== "string") {
+      return "partyDetails.contactName must be a string";
+    }
+    if (payload.partyDetails.contactMobile != null && typeof payload.partyDetails.contactMobile !== "string") {
+      return "partyDetails.contactMobile must be a string";
+    }
   }
 
   return null;
@@ -496,6 +504,8 @@ function mapInvitationRowToPublic(row) {
       parkingLocation: row.parking_location,
       cafeLocation: row.cafe_location,
       extraDetails: row.extra_details,
+      contactName: row.contact_name ?? null,
+      contactMobile: row.contact_mobile ?? null,
     },
     webShareUrl: createWebShareUrl(publicSlug),
   };
@@ -625,7 +635,7 @@ function findInvitationByToken(token) {
       .prepare(
         `
           SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time, location, message, cover_image, theme, created_at, updated_at
-          , parking_location, cafe_location, extra_details, rsvp_mood
+          , parking_location, cafe_location, extra_details, contact_name, contact_mobile, rsvp_mood
           FROM invitations
           WHERE share_token = ? OR public_slug = ?
         `,
@@ -640,7 +650,7 @@ function findInvitationById(invitationId) {
       .prepare(
         `
           SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time, location, message, cover_image, theme, created_at, updated_at
-          , parking_location, cafe_location, extra_details, rsvp_mood
+          , parking_location, cafe_location, extra_details, contact_name, contact_mobile, rsvp_mood
           FROM invitations
           WHERE id = ?
         `,
@@ -1804,9 +1814,9 @@ const server = createServer(async (req, res) => {
         `
           INSERT INTO invitations (
             id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time,
-            location, message, cover_image, theme, parking_location, cafe_location, extra_details, rsvp_mood, created_at, updated_at
+            location, message, cover_image, theme, parking_location, cafe_location, extra_details, contact_name, contact_mobile, rsvp_mood, created_at, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       ).run(
         invitationId,
@@ -1828,6 +1838,8 @@ const server = createServer(async (req, res) => {
         getString(payload.partyDetails?.parkingLocation) || null,
         getString(payload.partyDetails?.cafeLocation) || null,
         getString(payload.partyDetails?.extraDetails) || null,
+        getString(payload.partyDetails?.contactName) || null,
+        getString(payload.partyDetails?.contactMobile) || null,
         getString(payload.rsvpMood) || null,
         timestamp,
         timestamp,
@@ -1895,6 +1907,8 @@ const server = createServer(async (req, res) => {
             parking_location = ?,
             cafe_location = ?,
             extra_details = ?,
+            contact_name = ?,
+            contact_mobile = ?,
             rsvp_mood = ?,
             updated_at = ?
           WHERE id = ?
@@ -1915,6 +1929,8 @@ const server = createServer(async (req, res) => {
         getString(payload.partyDetails?.parkingLocation) || null,
         getString(payload.partyDetails?.cafeLocation) || null,
         getString(payload.partyDetails?.extraDetails) || null,
+        getString(payload.partyDetails?.contactName) || null,
+        getString(payload.partyDetails?.contactMobile) || null,
         getString(payload.rsvpMood) || null,
         nowIso(),
         invitation.id,
