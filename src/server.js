@@ -194,6 +194,7 @@ ensureColumnExists("invitations", "title_size", "TEXT");
 ensureColumnExists("invitations", "parking_location", "TEXT");
 ensureColumnExists("invitations", "cafe_location", "TEXT");
 ensureColumnExists("invitations", "extra_details", "TEXT");
+ensureColumnExists("invitations", "rsvp_mood", "TEXT");
 
 const DEFAULT_HOST_TOKEN = process.env.PLAYBAM_HOST_AUTH_TOKEN ?? "playbam-dev-host-token";
 const HOST_USER_ID = "host-demo-ana";
@@ -336,6 +337,9 @@ function validateCreatePayload(payload) {
   }
   if (payload.theme != null && typeof payload.theme !== "string") {
     return "theme must be a string";
+  }
+  if (payload.rsvpMood != null && typeof payload.rsvpMood !== "string") {
+    return "rsvpMood must be a string";
   }
   if (payload.partyDetails != null) {
     if (typeof payload.partyDetails !== "object") {
@@ -487,6 +491,7 @@ function mapInvitationRowToPublic(row) {
     message: row.message,
     coverImage: row.cover_image,
     theme: row.theme,
+    rsvpMood: row.rsvp_mood ?? null,
     partyDetails: {
       parkingLocation: row.parking_location,
       cafeLocation: row.cafe_location,
@@ -620,7 +625,7 @@ function findInvitationByToken(token) {
       .prepare(
         `
           SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time, location, message, cover_image, theme, created_at, updated_at
-          , parking_location, cafe_location, extra_details
+          , parking_location, cafe_location, extra_details, rsvp_mood
           FROM invitations
           WHERE share_token = ? OR public_slug = ?
         `,
@@ -635,7 +640,7 @@ function findInvitationById(invitationId) {
       .prepare(
         `
           SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time, location, message, cover_image, theme, created_at, updated_at
-          , parking_location, cafe_location, extra_details
+          , parking_location, cafe_location, extra_details, rsvp_mood
           FROM invitations
           WHERE id = ?
         `,
@@ -1799,9 +1804,9 @@ const server = createServer(async (req, res) => {
         `
           INSERT INTO invitations (
             id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time,
-            location, message, cover_image, theme, parking_location, cafe_location, extra_details, created_at, updated_at
+            location, message, cover_image, theme, parking_location, cafe_location, extra_details, rsvp_mood, created_at, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       ).run(
         invitationId,
@@ -1823,6 +1828,7 @@ const server = createServer(async (req, res) => {
         getString(payload.partyDetails?.parkingLocation) || null,
         getString(payload.partyDetails?.cafeLocation) || null,
         getString(payload.partyDetails?.extraDetails) || null,
+        getString(payload.rsvpMood) || null,
         timestamp,
         timestamp,
       );
@@ -1889,6 +1895,7 @@ const server = createServer(async (req, res) => {
             parking_location = ?,
             cafe_location = ?,
             extra_details = ?,
+            rsvp_mood = ?,
             updated_at = ?
           WHERE id = ?
         `,
@@ -1908,6 +1915,7 @@ const server = createServer(async (req, res) => {
         getString(payload.partyDetails?.parkingLocation) || null,
         getString(payload.partyDetails?.cafeLocation) || null,
         getString(payload.partyDetails?.extraDetails) || null,
+        getString(payload.rsvpMood) || null,
         nowIso(),
         invitation.id,
       );
