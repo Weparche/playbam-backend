@@ -152,6 +152,18 @@ db.exec(`
     FOREIGN KEY (wishlist_item_id) REFERENCES invitation_wishlist_items(id) ON DELETE CASCADE
   );
 
+  CREATE TABLE IF NOT EXISTS invitation_chat_messages (
+    id TEXT PRIMARY KEY,
+    invitation_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    sender_role TEXT NOT NULL CHECK (sender_role IN ('host', 'guest')),
+    sender_name TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (invitation_id) REFERENCES invitations(id) ON DELETE CASCADE
+  );
+
   CREATE INDEX IF NOT EXISTS idx_family_children_profile_id
     ON family_children (family_profile_id);
   CREATE INDEX IF NOT EXISTS idx_membership_requests_invitation_id
@@ -168,6 +180,8 @@ db.exec(`
     ON invitation_gift_reservations (invitation_id);
   CREATE INDEX IF NOT EXISTS idx_gift_participants_item_id
     ON invitation_gift_participants (wishlist_item_id);
+  CREATE INDEX IF NOT EXISTS idx_invitation_chat_messages_invitation_id
+    ON invitation_chat_messages (invitation_id, created_at, id);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_reservations_active_item
     ON invitation_gift_reservations (wishlist_item_id)
     WHERE status = 'active';
@@ -478,6 +492,23 @@ function validateGiftReservationPayload(payload) {
       note: getString(payload.note) || null,
     },
   };
+}
+
+function validateInvitationChatPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return { error: "Invalid chat payload" };
+  }
+
+  const message = getString(payload.message);
+  if (!message) {
+    return { error: "message is required" };
+  }
+
+  if (message.length > 500) {
+    return { error: "message must be 500 characters or fewer" };
+  }
+
+  return { value: { message } };
 }
 
 function mapInvitationRowToPublic(row) {
@@ -1342,6 +1373,67 @@ function serializeRsvp(rsvp) {
   };
 }
 
+function getInvitationChatMessages(invitationId) {
+  return db.prepare(
+    `
+      SELECT id, invitation_id, user_id, sender_role, sender_name, message, created_at, updated_at
+      FROM invitation_chat_messages
+      WHERE invitation_id = ?
+      ORDER BY datetime(created_at) ASC, id ASC
+    `,
+  ).all(invitationId);
+}
+
+function getInvitationChatMessageById(messageId) {
+  return db.prepare(
+    `
+      SELECT id, invitation_id, user_id, sender_role, sender_name, message, created_at, updated_at
+      FROM invitation_chat_messages
+      WHERE id = ?
+    `,
+  ).get(messageId) ?? null;
+}
+
+function serializeInvitationChatMessage(message) {
+  return {
+    id: message.id,
+    invitationId: message.invitation_id,
+    userId: message.user_id,
+    senderRole: message.sender_role,
+    senderName: message.sender_name,
+    message: message.message,
+    createdAt: message.created_at,
+    updatedAt: message.updated_at,
+  };
+}
+
+function createInvitationChatMessage(invitation, currentUser, payload) {
+  const messageId = randomId("chat");
+  const timestamp = nowIso();
+  const senderRole = invitation.host_user_id === currentUser.id ? "host" : "guest";
+  const senderName = getString(currentUser.displayName) || (senderRole === "host" ? "Organizator" : "Gost");
+
+  db.prepare(
+    `
+      INSERT INTO invitation_chat_messages (
+        id, invitation_id, user_id, sender_role, sender_name, message, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+  ).run(
+    messageId,
+    invitation.id,
+    currentUser.id,
+    senderRole,
+    senderName,
+    payload.message,
+    timestamp,
+    timestamp,
+  );
+
+  return getInvitationChatMessageById(messageId);
+}
+
 function upsertRsvp(invitationId, userId, payload) {
   const existing = getRsvpForUser(invitationId, userId);
   const timestamp = nowIso();
@@ -2056,6 +2148,40 @@ const server = createServer(async (req, res) => {
       if (!requireHostAccess(res, invitation, currentUser)) return;
 
       json(res, 200, getInvitationHostSummary(invitation.id));
+      return;
+    }
+
+    const chatMatch = pathname.match(/^\/api\/invitations\/([^/]+)\/chat$/);
+    if (chatMatch && req.method === "GET") {
+      const currentUser = requireCurrentUser(req, res);
+      if (!currentUser) return;
+
+      const invitation = requireInvitationById(res, decodeURIComponent(chatMatch[1]));
+      if (!invitation) return;
+      if (!requireApprovedInvitationAccess(res, invitation, currentUser)) return;
+
+      json(res, 200, {
+        messages: getInvitationChatMessages(invitation.id).map(serializeInvitationChatMessage),
+      });
+      return;
+    }
+
+    if (chatMatch && req.method === "POST") {
+      const currentUser = requireCurrentUser(req, res);
+      if (!currentUser) return;
+
+      const invitation = requireInvitationById(res, decodeURIComponent(chatMatch[1]));
+      if (!invitation) return;
+      if (!requireApprovedInvitationAccess(res, invitation, currentUser)) return;
+
+      const parsed = validateInvitationChatPayload(await readJsonBody(req));
+      if (parsed.error) {
+        json(res, 400, { error: parsed.error });
+        return;
+      }
+
+      const message = createInvitationChatMessage(invitation, currentUser, parsed.value);
+      json(res, 201, { message: serializeInvitationChatMessage(message) });
       return;
     }
 
