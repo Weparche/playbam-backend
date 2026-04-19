@@ -164,6 +164,26 @@ db.exec(`
     FOREIGN KEY (invitation_id) REFERENCES invitations(id) ON DELETE CASCADE
   );
 
+  CREATE TABLE IF NOT EXISTS auth_otp_codes (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    expires_at INTEGER NOT NULL,
+    used INTEGER DEFAULT 0,
+    created_at INTEGER DEFAULT (unixepoch())
+  );
+
+  CREATE TABLE IF NOT EXISTS auth_sessions (
+    id TEXT PRIMARY KEY,
+    token TEXT UNIQUE NOT NULL,
+    email TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    app_user_id TEXT NOT NULL,
+    created_at INTEGER DEFAULT (unixepoch()),
+    expires_at INTEGER NOT NULL
+  );
+
   CREATE INDEX IF NOT EXISTS idx_family_children_profile_id
     ON family_children (family_profile_id);
   CREATE INDEX IF NOT EXISTS idx_membership_requests_invitation_id
@@ -211,6 +231,7 @@ ensureColumnExists("invitations", "extra_details", "TEXT");
 ensureColumnExists("invitations", "contact_name", "TEXT");
 ensureColumnExists("invitations", "contact_mobile", "TEXT");
 ensureColumnExists("invitations", "rsvp_mood", "TEXT");
+ensureColumnExists("host_users", "app_user_id", "TEXT");
 
 const DEFAULT_HOST_TOKEN = process.env.PLAYBAM_HOST_AUTH_TOKEN ?? "playbam-dev-host-token";
 const HOST_USER_ID = "host-demo-ana";
@@ -218,6 +239,7 @@ const HOST_EMAIL = "ana@vidimose.hr";
 const HOST_NAME = "Ana Horvat";
 const WEB_BASE_URL = (process.env.PLAYBAM_WEB_BASE_URL ?? "http://localhost:5173").replace(/\/$/, "");
 const PORT = Number(process.env.PORT ?? "4000");
+const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
 
 const ALLOWED_ORIGINS = new Set([
   "https://vidimose.hr",
@@ -237,6 +259,59 @@ function nowIso() {
 
 function hashToken(token) {
   return createHash("sha256").update(token).digest("hex");
+}
+
+function generateOtp() {
+  return String(100000 + (randomBytes(3).readUIntBE(0, 3) % 900000)).padStart(6, "0");
+}
+
+function hashOtp(code) {
+  return createHash("sha256").update(code).digest("hex");
+}
+
+async function sendOtpEmail(email, code, displayName) {
+  if (!RESEND_API_KEY) {
+    console.log(`[DEV] OTP for ${email}: ${code}`);
+    return;
+  }
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: "VidimoSe.hr <noreply@vidimose.hr>",
+      to: email,
+      subject: `Tvoj kod: ${code}`,
+      html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px"><h2 style="color:#2d1a0e">Bok${displayName ? " " + displayName : ""}!</h2><p>Tvoj jednokratni kod za prijavu na <strong>VidimoSe.hr</strong> je:</p><div style="font-size:40px;font-weight:bold;letter-spacing:10px;color:#c0392b;padding:20px 0">${code}</div><p style="color:#666">Kod vrijedi <strong>10 minuta</strong>.</p><p style="color:#999;font-size:12px">Ako nisi tražio/la ovaj kod, zanemari ovu poruku.</p></div>`,
+    }),
+  });
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Resend error: ${err}`);
+  }
+}
+
+function getSessionByToken(token) {
+  if (!token) return null;
+  const now = Math.floor(Date.now() / 1000);
+  return db.prepare(
+    "SELECT id, token, email, display_name, app_user_id, expires_at FROM auth_sessions WHERE token = ? AND expires_at > ?",
+  ).get(token, now) ?? null;
+}
+
+function findOrCreateHostUserByEmail(email, displayName) {
+  const existing = db.prepare("SELECT id, email, display_name FROM host_users WHERE email = ?").get(email);
+  if (existing) return existing;
+
+  const hostId = randomId("host");
+  const hostToken = randomBytes(32).toString("hex");
+  const appUser = db.prepare("SELECT id FROM app_users WHERE email = ?").get(email);
+  db.prepare("INSERT INTO host_users (id, auth_token_hash, email, display_name, app_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(
+    hostId, hashToken(hostToken), email, displayName || displayNameFromEmail(email), appUser?.id ?? null, nowIso(),
+  );
+  return { id: hostId, email, display_name: displayName || displayNameFromEmail(email) };
 }
 
 function randomId(prefix) {
@@ -645,7 +720,22 @@ function getUserSummaryById(userId) {
 }
 
 function resolveCurrentUser(req) {
-  const hostUser = getHostUserByToken(getBearerToken(req));
+  const bearerToken = getBearerToken(req);
+
+  // 1. OTP-verified session token
+  const session = getSessionByToken(bearerToken);
+  if (session) {
+    return {
+      id: session.app_user_id,
+      email: session.email,
+      displayName: session.display_name,
+      authType: "session",
+      isHostIdentity: true,
+    };
+  }
+
+  // 2. Legacy host_users bearer token
+  const hostUser = getHostUserByToken(bearerToken);
   if (hostUser) {
     return {
       id: hostUser.id,
@@ -656,12 +746,12 @@ function resolveCurrentUser(req) {
     };
   }
 
+  // 3. Temporary header identity (guest)
   const temporaryIdentity = getTemporaryIdentityHeaders(req);
   if (!temporaryIdentity) {
     return null;
   }
 
-  // TODO(auth): replace this header-based identity bridge with real session/auth middleware.
   const appUser = upsertAppUser(temporaryIdentity.email, temporaryIdentity.displayName);
   return {
     id: appUser.id,
@@ -1144,7 +1234,8 @@ function serializeWishlistItem(item, reservation, currentUser, isHost) {
 }
 
 function serializeWishlistItems(invitationId, currentUser) {
-  const isHost = Boolean(currentUser && currentUser.id === findInvitationById(invitationId)?.host_user_id);
+  const inv = findInvitationById(invitationId);
+  const isHost = Boolean(currentUser && inv && isHostUser(inv, currentUser));
   const items = listWishlistItemsForInvitation(invitationId, isHost);
   return items.map((item) => serializeWishlistItem(item, getActiveGiftReservationForItem(item.id), currentUser, isHost));
 }
@@ -1284,7 +1375,7 @@ function requireApprovedInvitationAccess(res, invitation, currentUser) {
     return false;
   }
 
-  if (invitation.host_user_id === currentUser.id) {
+  if (isHostUser(invitation, currentUser)) {
     return true;
   }
 
@@ -1302,7 +1393,7 @@ function requireApprovedGuestWishlistAccess(res, invitation, currentUser) {
     return false;
   }
 
-  if (invitation.host_user_id === currentUser.id) {
+  if (isHostUser(invitation, currentUser)) {
     json(res, 403, { error: "Invitation host cannot reserve gifts" });
     return false;
   }
@@ -1422,7 +1513,7 @@ function serializeInvitationChatMessage(message) {
 function createInvitationChatMessage(invitation, currentUser, payload) {
   const messageId = randomId("chat");
   const timestamp = nowIso();
-  const senderRole = invitation.host_user_id === currentUser.id ? "host" : "guest";
+  const senderRole = isHostUser(invitation, currentUser) ? "host" : "guest";
   const senderName = getString(currentUser.displayName) || (senderRole === "host" ? "Organizator" : "Gost");
 
   db.prepare(
@@ -1472,21 +1563,28 @@ function upsertRsvp(invitationId, userId, payload) {
   return getRsvpForUser(invitationId, userId);
 }
 
+function isHostUser(invitation, currentUser) {
+  if (!invitation || !currentUser) return false;
+  if (invitation.host_user_id === currentUser.id) return true;
+  // Session users: their id is app_user_id; check if linked host_users record owns this invitation
+  if (currentUser.authType === "session") {
+    const linked = db.prepare("SELECT id FROM host_users WHERE app_user_id = ?").get(currentUser.id);
+    return Boolean(linked && linked.id === invitation.host_user_id);
+  }
+  return false;
+}
+
 function getMembershipStatusForUser(invitation, userId) {
   if (!userId) {
     return null;
   }
-  if (invitation.host_user_id === userId) {
-    return "approved";
-  }
-
   return getMembershipRequestForUser(invitation.id, userId)?.status ?? null;
 }
 
 function getInvitationAccess(invitation, currentUser) {
   const loggedIn = Boolean(currentUser);
-  const isHost = Boolean(currentUser && invitation.host_user_id === currentUser.id);
-  const membershipStatus = currentUser ? getMembershipStatusForUser(invitation, currentUser.id) : null;
+  const isHost = Boolean(currentUser && isHostUser(invitation, currentUser));
+  const membershipStatus = (!isHost && currentUser) ? getMembershipStatusForUser(invitation, currentUser.id) : null;
   const canAccessPrivateInvitation = Boolean(isHost || membershipStatus === "approved");
 
   return {
@@ -1520,7 +1618,7 @@ function requireInvitationById(res, invitationId) {
 }
 
 function requireHostAccess(res, invitation, currentUser) {
-  if (!currentUser || invitation.host_user_id !== currentUser.id) {
+  if (!currentUser || !isHostUser(invitation, currentUser)) {
     json(res, 403, { error: "Invitation host access required" });
     return false;
   }
@@ -1900,8 +1998,20 @@ const server = createServer(async (req, res) => {
 
   try {
     if (req.method === "POST" && pathname === "/api/invitations") {
-      const currentHostToken = getBearerToken(req) ?? DEFAULT_HOST_TOKEN;
-      const hostUser = getHostUserByToken(currentHostToken) ?? { id: HOST_USER_ID };
+      const bearerToken = getBearerToken(req);
+      let hostUser = { id: HOST_USER_ID };
+      if (bearerToken) {
+        const sess = getSessionByToken(bearerToken);
+        if (sess) {
+          hostUser = findOrCreateHostUserByEmail(sess.email, sess.display_name);
+          // Link app_user_id to host_users record if not already set
+          if (hostUser.id && sess.app_user_id) {
+            db.prepare("UPDATE host_users SET app_user_id = ? WHERE id = ? AND app_user_id IS NULL").run(sess.app_user_id, hostUser.id);
+          }
+        } else {
+          hostUser = getHostUserByToken(bearerToken) ?? hostUser;
+        }
+      }
 
       const payload = await readJsonBody(req);
       const validationError = validateCreatePayload(payload);
@@ -1955,7 +2065,7 @@ const server = createServer(async (req, res) => {
         shareToken,
         publicSlug,
         webShareUrl: createWebShareUrl(publicSlug),
-        hostAuthToken: currentHostToken,
+        hostAuthToken: bearerToken || DEFAULT_HOST_TOKEN,
       });
       return;
     }
@@ -2100,7 +2210,7 @@ const server = createServer(async (req, res) => {
 
       const invitation = requireInvitationById(res, decodeURIComponent(membershipRequestsMatch[1]));
       if (!invitation) return;
-      if (invitation.host_user_id === currentUser.id) {
+      if (isHostUser(invitation, currentUser)) {
         json(res, 400, { error: "Invitation host cannot create a membership request" });
         return;
       }
@@ -2217,7 +2327,7 @@ const server = createServer(async (req, res) => {
 
       const invitation = requireInvitationById(res, decodeURIComponent(wishlistMatch[1]));
       if (!invitation) return;
-      const isHost = invitation.host_user_id === currentUser.id;
+      const isHost = isHostUser(invitation, currentUser);
       if (!isHost && !requireApprovedGuestWishlistAccess(res, invitation, currentUser)) return;
 
       const parsed = validateWishlistItemPayload(await readJsonBody(req));
@@ -2279,7 +2389,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const isHost = invitation.host_user_id === currentUser.id;
+      const isHost = isHostUser(invitation, currentUser);
       const canDeleteOwnGuestItem = item.added_by_user_id === currentUser.id;
 
       if (!isHost && !canDeleteOwnGuestItem) {
@@ -2379,7 +2489,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const isHost = invitation.host_user_id === currentUser.id;
+      const isHost = isHostUser(invitation, currentUser);
       if (!isHost) {
         if (!requireApprovedGuestWishlistAccess(res, invitation, currentUser)) return;
         if (reservation.reserved_by_user_id !== currentUser.id) {
@@ -2443,7 +2553,7 @@ const server = createServer(async (req, res) => {
 
       const invitation = requireInvitationById(res, decodeURIComponent(rsvpMatch[1]));
       if (!invitation) return;
-      if (invitation.host_user_id === currentUser.id) {
+      if (isHostUser(invitation, currentUser)) {
         json(res, 403, { error: "Invitation host cannot RSVP to their own invitation" });
         return;
       }
@@ -2490,6 +2600,155 @@ const server = createServer(async (req, res) => {
       } catch {
         json(res, 200, { title: null, image: null, domain: null, favicon: null });
       }
+      return;
+    }
+
+    if (req.method === "POST" && pathname === "/api/auth/send-otp") {
+      const { email: rawEmail, name: rawName } = await readJsonBody(req);
+      const email = normalizeEmail(rawEmail);
+      if (!email) {
+        json(res, 400, { error: "Email je obavezan" });
+        return;
+      }
+      const displayName = getString(rawName) || displayNameFromEmail(email);
+      const code = generateOtp();
+      const expiresAt = Math.floor(Date.now() / 1000) + 600;
+      const otpId = randomId("otp");
+
+      db.prepare("UPDATE auth_otp_codes SET used = 1 WHERE email = ? AND used = 0").run(email);
+      db.prepare("INSERT INTO auth_otp_codes (id, email, code_hash, display_name, expires_at) VALUES (?, ?, ?, ?, ?)").run(
+        otpId, email, hashOtp(code), displayName, expiresAt,
+      );
+
+      try {
+        await sendOtpEmail(email, code, displayName);
+        json(res, 200, { ok: true });
+      } catch (err) {
+        console.error("Failed to send OTP email", err);
+        json(res, 500, { error: "Slanje e-maila nije uspjelo. Pokušaj ponovno." });
+      }
+      return;
+    }
+
+    if (req.method === "POST" && pathname === "/api/auth/verify-otp") {
+      const { email: rawEmail, code: rawCode } = await readJsonBody(req);
+      const email = normalizeEmail(rawEmail);
+      const code = getString(rawCode);
+
+      if (!email || !code) {
+        json(res, 400, { error: "Email i kod su obavezni" });
+        return;
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      const otpRecord = db.prepare(
+        "SELECT * FROM auth_otp_codes WHERE email = ? AND used = 0 AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
+      ).get(email, now);
+
+      if (!otpRecord || otpRecord.code_hash !== hashOtp(code)) {
+        json(res, 401, { error: "Netočan ili istekao kod. Zatraži novi." });
+        return;
+      }
+
+      db.prepare("UPDATE auth_otp_codes SET used = 1 WHERE id = ?").run(otpRecord.id);
+
+      const appUser = upsertAppUser(email, otpRecord.display_name);
+      const sessionToken = randomBytes(32).toString("base64url");
+      const sessionId = randomId("sess");
+      const sessionExpiresAt = now + 30 * 24 * 3600;
+
+      db.prepare(
+        "INSERT INTO auth_sessions (id, token, email, display_name, app_user_id, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+      ).run(sessionId, sessionToken, email, otpRecord.display_name, appUser.id, sessionExpiresAt);
+
+      json(res, 200, { token: sessionToken, email, displayName: otpRecord.display_name });
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/auth/me") {
+      const session = getSessionByToken(getBearerToken(req));
+      if (!session) {
+        json(res, 401, { error: "Invalid or expired session" });
+        return;
+      }
+      json(res, 200, { token: session.token, email: session.email, displayName: session.display_name });
+      return;
+    }
+
+    if (req.method === "POST" && pathname === "/api/auth/logout") {
+      const token = getBearerToken(req);
+      if (token) {
+        db.prepare("DELETE FROM auth_sessions WHERE token = ?").run(token);
+      }
+      json(res, 200, { ok: true });
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/my/invitations") {
+      const session = getSessionByToken(getBearerToken(req));
+      if (!session) {
+        json(res, 401, { error: "Prijava je potrebna" });
+        return;
+      }
+      const rows = db.prepare(
+        `SELECT inv.id, inv.share_token, inv.public_slug, inv.title, inv.celebrant_name,
+                inv.date, inv.time, inv.location, inv.theme, inv.cover_image, inv.created_at
+         FROM invitations inv
+         JOIN host_users hu ON hu.id = inv.host_user_id
+         WHERE hu.email = ?
+         ORDER BY inv.created_at DESC`,
+      ).all(session.email);
+
+      json(res, 200, { invitations: rows.map((row) => ({
+        id: row.id,
+        shareToken: row.share_token,
+        publicSlug: row.public_slug,
+        title: row.title,
+        celebrantName: row.celebrant_name,
+        date: row.date,
+        time: row.time,
+        location: row.location,
+        theme: row.theme || row.cover_image,
+        webShareUrl: createWebShareUrl(row.public_slug),
+        createdAt: row.created_at,
+      })) });
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/my/rsvps") {
+      const session = getSessionByToken(getBearerToken(req));
+      if (!session) {
+        json(res, 401, { error: "Prijava je potrebna" });
+        return;
+      }
+      const rows = db.prepare(
+        `SELECT rsvp.id, rsvp.status, rsvp.note, rsvp.created_at,
+                inv.id as inv_id, inv.share_token, inv.public_slug, inv.title, inv.celebrant_name,
+                inv.date, inv.time, inv.location, inv.theme, inv.cover_image
+         FROM invitation_rsvps rsvp
+         JOIN invitations inv ON inv.id = rsvp.invitation_id
+         WHERE rsvp.user_id = ?
+         ORDER BY rsvp.created_at DESC`,
+      ).all(session.app_user_id);
+
+      json(res, 200, { rsvps: rows.map((row) => ({
+        id: row.id,
+        status: row.status,
+        note: row.note,
+        createdAt: row.created_at,
+        invitation: {
+          id: row.inv_id,
+          shareToken: row.share_token,
+          publicSlug: row.public_slug,
+          title: row.title,
+          celebrantName: row.celebrant_name,
+          date: row.date,
+          time: row.time,
+          location: row.location,
+          theme: row.theme || row.cover_image,
+          webShareUrl: createWebShareUrl(row.public_slug),
+        },
+      })) });
       return;
     }
 
