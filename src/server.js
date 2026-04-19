@@ -214,10 +214,22 @@ ensureColumnExists("invitations", "rsvp_mood", "TEXT");
 
 const DEFAULT_HOST_TOKEN = process.env.PLAYBAM_HOST_AUTH_TOKEN ?? "playbam-dev-host-token";
 const HOST_USER_ID = "host-demo-ana";
-const HOST_EMAIL = "ana@playbam.hr";
+const HOST_EMAIL = "ana@vidimose.hr";
 const HOST_NAME = "Ana Horvat";
 const WEB_BASE_URL = (process.env.PLAYBAM_WEB_BASE_URL ?? "http://localhost:5173").replace(/\/$/, "");
 const PORT = Number(process.env.PORT ?? "4000");
+
+const ALLOWED_ORIGINS = new Set([
+  "https://vidimose.hr",
+  "https://www.vidimose.hr",
+  "http://localhost:5173",
+  "http://localhost:4173",
+]);
+
+function getCorsOrigin(req) {
+  const origin = req.headers.origin ?? "";
+  return ALLOWED_ORIGINS.has(origin) ? origin : "https://vidimose.hr";
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -1874,9 +1886,10 @@ const server = createServer(async (req, res) => {
 
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": getCorsOrigin(req),
       "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Playbam-User-Email, X-Playbam-User-Name",
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+      "Vary": "Origin",
     });
     res.end();
     return;
