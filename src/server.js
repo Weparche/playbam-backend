@@ -221,6 +221,7 @@ function ensureColumnExists(tableName, columnName, columnDefinition) {
 
 ensureColumnExists("invitation_wishlist_items", "added_by_user_id", "TEXT");
 ensureColumnExists("invitation_wishlist_items", "added_for_child_name", "TEXT");
+ensureColumnExists("invitation_wishlist_items", "is_group_gift", "INTEGER NOT NULL DEFAULT 0");
 ensureColumnExists("invitations", "title_font", "TEXT");
 ensureColumnExists("invitations", "title_color", "TEXT");
 ensureColumnExists("invitations", "title_outline", "TEXT");
@@ -577,6 +578,7 @@ function validateWishlistItemPayload(payload) {
   }
 
   const isActive = payload.isActive == null ? true : Boolean(payload.isActive);
+  const isGroupGift = payload.isGroupGift == null ? false : Boolean(payload.isGroupGift);
 
   return {
     value: {
@@ -587,6 +589,7 @@ function validateWishlistItemPayload(payload) {
       imageUrl: getString(payload.imageUrl) || null,
       priorityOrder,
       isActive,
+      isGroupGift,
     },
   };
 }
@@ -1087,7 +1090,7 @@ function listWishlistItemsForInvitation(invitationId, includeInactive = true) {
   return db
     .prepare(
       `
-        SELECT id, invitation_id, title, description, url, price_label, image_url, priority_order, is_active, added_by_user_id, added_for_child_name, created_at, updated_at
+        SELECT id, invitation_id, title, description, url, price_label, image_url, priority_order, is_active, is_group_gift, added_by_user_id, added_for_child_name, created_at, updated_at
         FROM invitation_wishlist_items
         WHERE invitation_id = ? ${whereClause}
         ORDER BY priority_order ASC, created_at ASC
@@ -1101,7 +1104,7 @@ function getWishlistItemById(itemId) {
     db
       .prepare(
         `
-          SELECT id, invitation_id, title, description, url, price_label, image_url, priority_order, is_active, added_by_user_id, added_for_child_name, created_at, updated_at
+          SELECT id, invitation_id, title, description, url, price_label, image_url, priority_order, is_active, is_group_gift, added_by_user_id, added_for_child_name, created_at, updated_at
           FROM invitation_wishlist_items
           WHERE id = ?
         `,
@@ -1257,6 +1260,7 @@ function serializeWishlistItem(item, reservation, currentUser, isHost) {
     priceLabel: item.price_label,
     imageUrl: item.image_url,
     priorityOrder: item.priority_order,
+    isGroupGift: Boolean(item.is_group_gift),
     isActive: Boolean(item.is_active),
     addedByUserId: item.added_by_user_id ?? null,
     addedByName: addedBy?.displayName ?? null,
@@ -1299,9 +1303,9 @@ function createWishlistItem(invitationId, payload, currentUser = null) {
   db.prepare(
     `
       INSERT INTO invitation_wishlist_items (
-        id, invitation_id, title, description, url, price_label, image_url, priority_order, is_active, added_by_user_id, added_for_child_name, created_at, updated_at
+        id, invitation_id, title, description, url, price_label, image_url, priority_order, is_active, is_group_gift, added_by_user_id, added_for_child_name, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
   ).run(
     itemId,
@@ -1313,6 +1317,7 @@ function createWishlistItem(invitationId, payload, currentUser = null) {
     payload.imageUrl,
     payload.priorityOrder,
     payload.isActive ? 1 : 0,
+    payload.isGroupGift ? 1 : 0,
     currentUser?.id ?? null,
     addedForChildName,
     timestamp,
@@ -1327,7 +1332,7 @@ function updateWishlistItem(item, payload) {
   db.prepare(
     `
       UPDATE invitation_wishlist_items
-      SET title = ?, description = ?, url = ?, price_label = ?, image_url = ?, priority_order = ?, is_active = ?, updated_at = ?
+      SET title = ?, description = ?, url = ?, price_label = ?, image_url = ?, priority_order = ?, is_active = ?, is_group_gift = ?, updated_at = ?
       WHERE id = ?
     `,
   ).run(
@@ -1338,6 +1343,7 @@ function updateWishlistItem(item, payload) {
     payload.imageUrl,
     payload.priorityOrder,
     payload.isActive ? 1 : 0,
+    payload.isGroupGift ? 1 : 0,
     timestamp,
     item.id,
   );
@@ -2473,13 +2479,19 @@ const server = createServer(async (req, res) => {
       }
 
       const activeReservation = getActiveGiftReservationForItem(item.id);
+      const participateNote = "Sudjeluje u poklonu";
+      if (item.is_group_gift && !activeReservation && parsed.value.note !== participateNote) {
+        json(res, 409, { error: "Ovaj poklon je grupni; koristi sudjelovanje umjesto pune rezervacije." });
+        return;
+      }
+
       if (activeReservation) {
         if (activeReservation.reserved_by_user_id === currentUser.id) {
           json(res, 200, { item: serializeWishlistItem(item, activeReservation, currentUser, false) });
           return;
         }
 
-        if (parsed.value.note === "Sudjeluje u poklonu") {
+        if (parsed.value.note === participateNote) {
           const existingParticipant = getActiveGiftParticipantForItemAndUser(item.id, currentUser.id);
           if (!existingParticipant) {
             const participantChildName =
