@@ -539,14 +539,9 @@ function validateMembershipRequestPayload(payload) {
     return { error: "Invalid membership request payload" };
   }
 
-  if (!Array.isArray(payload.childIds) || payload.childIds.length === 0) {
-    return { error: "childIds must contain at least one child id" };
-  }
-
-  const childIds = [...new Set(payload.childIds.map((value) => getString(value)).filter(Boolean))];
-  if (childIds.length === 0) {
-    return { error: "childIds must contain at least one child id" };
-  }
+  const raw = payload.childIds;
+  const list = Array.isArray(raw) ? raw : [];
+  const childIds = [...new Set(list.map((value) => getString(value)).filter(Boolean))];
 
   return { value: { childIds } };
 }
