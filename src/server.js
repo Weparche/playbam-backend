@@ -69,8 +69,8 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS family_children (
     id TEXT PRIMARY KEY,
     family_profile_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    age INTEGER NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    age INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (family_profile_id) REFERENCES family_profiles(id) ON DELETE CASCADE
@@ -232,6 +232,37 @@ ensureColumnExists("invitations", "contact_name", "TEXT");
 ensureColumnExists("invitations", "contact_mobile", "TEXT");
 ensureColumnExists("invitations", "rsvp_mood", "TEXT");
 ensureColumnExists("host_users", "app_user_id", "TEXT");
+
+/** Postojeće baze: age je bio NOT NULL — omogući NULL i prazno ime. */
+function migrateFamilyChildrenOptionalFields() {
+  const cols = db.prepare("PRAGMA table_info(family_children)").all();
+  const ageCol = cols.find((column) => column.name === "age");
+  if (!ageCol || ageCol.notnull === 0) {
+    return;
+  }
+
+  db.exec(`
+    BEGIN TRANSACTION;
+    CREATE TABLE family_children__migrate (
+      id TEXT PRIMARY KEY,
+      family_profile_id TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      age INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (family_profile_id) REFERENCES family_profiles(id) ON DELETE CASCADE
+    );
+    INSERT INTO family_children__migrate (id, family_profile_id, name, age, created_at, updated_at)
+      SELECT id, family_profile_id, name, age, created_at, updated_at FROM family_children;
+    DROP TABLE family_children;
+    ALTER TABLE family_children__migrate RENAME TO family_children;
+    CREATE INDEX IF NOT EXISTS idx_family_children_profile_id
+      ON family_children (family_profile_id);
+    COMMIT;
+  `);
+}
+
+migrateFamilyChildrenOptionalFields();
 
 const DEFAULT_HOST_TOKEN = process.env.PLAYBAM_HOST_AUTH_TOKEN ?? "playbam-dev-host-token";
 const HOST_USER_ID = "host-demo-ana";
@@ -479,23 +510,24 @@ function validateFamilyProfilePayload(payload) {
     return { error: "parentName is required" };
   }
 
-  if (!Array.isArray(payload.children) || payload.children.length === 0) {
-    return { error: "children must contain at least one child" };
-  }
-
+  const rawChildren = Array.isArray(payload.children) ? payload.children : [];
   const children = [];
-  for (const child of payload.children) {
-    const name = getString(child?.name);
-    const age = getInteger(child?.age);
-    const childId = getString(child?.id) || null;
+  for (const child of rawChildren) {
+    const name = getString(child?.name) || "";
+    const hasAgeInput = child?.age !== undefined && child?.age !== null && child?.age !== "";
+    const age = hasAgeInput ? getInteger(child?.age) : null;
 
-    if (!name) {
-      return { error: "child.name is required" };
+    if (!name && !hasAgeInput) {
+      continue;
     }
-    if (age == null || age < 1 || age > 18) {
+    if (hasAgeInput && age == null) {
+      return { error: "child.age must be an integer between 1 and 18 when provided" };
+    }
+    if (age != null && (age < 1 || age > 18)) {
       return { error: "child.age must be an integer between 1 and 18" };
     }
 
+    const childId = getString(child?.id) || null;
     children.push({ id: childId, name, age });
   }
 
@@ -838,7 +870,7 @@ function serializeFamilyProfile(record) {
       id: child.id,
       familyProfileId: child.family_profile_id,
       name: child.name,
-      age: child.age,
+      age: child.age == null ? null : child.age,
       createdAt: child.created_at,
       updatedAt: child.updated_at,
     })),
@@ -856,7 +888,14 @@ function replaceFamilyChildren(familyProfileId, children) {
 
   for (const child of children) {
     const timestamp = nowIso();
-    insertChild.run(child.id || randomId("child"), familyProfileId, child.name, child.age, timestamp, timestamp);
+    insertChild.run(
+      child.id || randomId("child"),
+      familyProfileId,
+      child.name ?? "",
+      child.age == null ? null : child.age,
+      timestamp,
+      timestamp,
+    );
   }
 }
 
@@ -942,7 +981,7 @@ function serializeMembershipRequest(request) {
     id: child.id,
     familyProfileId: child.family_profile_id,
     name: child.name,
-    age: child.age,
+    age: child.age == null ? null : child.age,
     createdAt: child.created_at,
     updatedAt: child.updated_at,
   }));
@@ -2191,6 +2230,17 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "DELETE" && pathname === "/api/me/family-profile") {
+      const session = getSessionByToken(getBearerToken(req));
+      if (!session) {
+        json(res, 401, { error: "Prijava je potrebna" });
+        return;
+      }
+      db.prepare("DELETE FROM family_profiles WHERE user_id = ?").run(session.app_user_id);
+      json(res, 200, { ok: true });
+      return;
+    }
+
     const membershipRequestMeMatch = pathname.match(/^\/api\/invitations\/([^/]+)\/membership-request\/me$/);
     if (req.method === "GET" && membershipRequestMeMatch) {
       const currentUser = requireCurrentUser(req, res);
@@ -2749,6 +2799,49 @@ const server = createServer(async (req, res) => {
           webShareUrl: createWebShareUrl(row.public_slug),
         },
       })) });
+      return;
+    }
+
+    const myInvitationDeleteMatch = pathname.match(/^\/api\/my\/invitations\/([^/]+)$/);
+    if (req.method === "DELETE" && myInvitationDeleteMatch) {
+      const session = getSessionByToken(getBearerToken(req));
+      if (!session) {
+        json(res, 401, { error: "Prijava je potrebna" });
+        return;
+      }
+      const invitationId = decodeURIComponent(myInvitationDeleteMatch[1]);
+      const owned = db
+        .prepare(
+          `
+            SELECT inv.id FROM invitations inv
+            INNER JOIN host_users hu ON hu.id = inv.host_user_id
+            WHERE inv.id = ? AND hu.email = ?
+          `,
+        )
+        .get(invitationId, session.email);
+      if (!owned) {
+        json(res, 404, { error: "Pozivnica nije pronađena" });
+        return;
+      }
+      db.prepare("DELETE FROM invitations WHERE id = ?").run(invitationId);
+      json(res, 200, { deleted: true });
+      return;
+    }
+
+    const myRsvpDeleteMatch = pathname.match(/^\/api\/my\/rsvps\/([^/]+)$/);
+    if (req.method === "DELETE" && myRsvpDeleteMatch) {
+      const session = getSessionByToken(getBearerToken(req));
+      if (!session) {
+        json(res, 401, { error: "Prijava je potrebna" });
+        return;
+      }
+      const rsvpId = decodeURIComponent(myRsvpDeleteMatch[1]);
+      const result = db.prepare("DELETE FROM invitation_rsvps WHERE id = ? AND user_id = ?").run(rsvpId, session.app_user_id);
+      if (result.changes === 0) {
+        json(res, 404, { error: "RSVP nije pronađen" });
+        return;
+      }
+      json(res, 200, { deleted: true });
       return;
     }
 
