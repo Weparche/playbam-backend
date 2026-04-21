@@ -231,6 +231,9 @@ ensureColumnExists("invitations", "cafe_location", "TEXT");
 ensureColumnExists("invitations", "extra_details", "TEXT");
 ensureColumnExists("invitations", "contact_name", "TEXT");
 ensureColumnExists("invitations", "contact_mobile", "TEXT");
+ensureColumnExists("invitations", "wishlist_keks_pay_url", "TEXT");
+ensureColumnExists("invitations", "wishlist_bank_iban", "TEXT");
+ensureColumnExists("invitations", "wishlist_payment_image_url", "TEXT");
 ensureColumnExists("invitations", "rsvp_mood", "TEXT");
 ensureColumnExists("host_users", "app_user_id", "TEXT");
 
@@ -496,6 +499,19 @@ function validateCreatePayload(payload) {
     if (payload.partyDetails.contactMobile != null && typeof payload.partyDetails.contactMobile !== "string") {
       return "partyDetails.contactMobile must be a string";
     }
+    if (payload.partyDetails.wishlistKeksPayUrl != null && typeof payload.partyDetails.wishlistKeksPayUrl !== "string") {
+      return "partyDetails.wishlistKeksPayUrl must be a string";
+    }
+    if (payload.partyDetails.wishlistBankIban != null && typeof payload.partyDetails.wishlistBankIban !== "string") {
+      return "partyDetails.wishlistBankIban must be a string";
+    }
+    if (payload.partyDetails.wishlistPaymentImageUrl != null && typeof payload.partyDetails.wishlistPaymentImageUrl !== "string") {
+      return "partyDetails.wishlistPaymentImageUrl must be a string";
+    }
+    const paymentImg = getString(payload.partyDetails.wishlistPaymentImageUrl);
+    if (paymentImg.length > 2_000_000) {
+      return "partyDetails.wishlistPaymentImageUrl is too large";
+    }
   }
 
   return null;
@@ -654,6 +670,9 @@ function mapInvitationRowToPublic(row) {
       extraDetails: row.extra_details,
       contactName: row.contact_name ?? null,
       contactMobile: row.contact_mobile ?? null,
+      wishlistKeksPayUrl: row.wishlist_keks_pay_url ?? null,
+      wishlistBankIban: row.wishlist_bank_iban ?? null,
+      wishlistPaymentImageUrl: row.wishlist_payment_image_url ?? null,
     },
     webShareUrl: createWebShareUrl(publicSlug),
   };
@@ -798,7 +817,8 @@ function findInvitationByToken(token) {
       .prepare(
         `
           SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time, location, message, cover_image, theme, created_at, updated_at
-          , parking_location, cafe_location, extra_details, contact_name, contact_mobile, rsvp_mood
+          , parking_location, cafe_location, extra_details, contact_name, contact_mobile
+          , wishlist_keks_pay_url, wishlist_bank_iban, wishlist_payment_image_url, rsvp_mood
           FROM invitations
           WHERE share_token = ? OR public_slug = ?
         `,
@@ -813,7 +833,8 @@ function findInvitationById(invitationId) {
       .prepare(
         `
           SELECT id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time, location, message, cover_image, theme, created_at, updated_at
-          , parking_location, cafe_location, extra_details, contact_name, contact_mobile, rsvp_mood
+          , parking_location, cafe_location, extra_details, contact_name, contact_mobile
+          , wishlist_keks_pay_url, wishlist_bank_iban, wishlist_payment_image_url, rsvp_mood
           FROM invitations
           WHERE id = ?
         `,
@@ -2069,9 +2090,10 @@ const server = createServer(async (req, res) => {
         `
           INSERT INTO invitations (
             id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time,
-            location, message, cover_image, theme, parking_location, cafe_location, extra_details, contact_name, contact_mobile, rsvp_mood, created_at, updated_at
+            location, message, cover_image, theme, parking_location, cafe_location, extra_details, contact_name, contact_mobile,
+            wishlist_keks_pay_url, wishlist_bank_iban, wishlist_payment_image_url, rsvp_mood, created_at, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       ).run(
         invitationId,
@@ -2095,6 +2117,9 @@ const server = createServer(async (req, res) => {
         getString(payload.partyDetails?.extraDetails) || null,
         getString(payload.partyDetails?.contactName) || null,
         getString(payload.partyDetails?.contactMobile) || null,
+        getString(payload.partyDetails?.wishlistKeksPayUrl) || null,
+        getString(payload.partyDetails?.wishlistBankIban) || null,
+        getString(payload.partyDetails?.wishlistPaymentImageUrl) || null,
         getString(payload.rsvpMood) || null,
         timestamp,
         timestamp,
@@ -2164,6 +2189,9 @@ const server = createServer(async (req, res) => {
             extra_details = ?,
             contact_name = ?,
             contact_mobile = ?,
+            wishlist_keks_pay_url = ?,
+            wishlist_bank_iban = ?,
+            wishlist_payment_image_url = ?,
             rsvp_mood = ?,
             updated_at = ?
           WHERE id = ?
@@ -2186,6 +2214,9 @@ const server = createServer(async (req, res) => {
         getString(payload.partyDetails?.extraDetails) || null,
         getString(payload.partyDetails?.contactName) || null,
         getString(payload.partyDetails?.contactMobile) || null,
+        getString(payload.partyDetails?.wishlistKeksPayUrl) || null,
+        getString(payload.partyDetails?.wishlistBankIban) || null,
+        getString(payload.partyDetails?.wishlistPaymentImageUrl) || null,
         getString(payload.rsvpMood) || null,
         nowIso(),
         invitation.id,
@@ -2768,6 +2799,47 @@ const server = createServer(async (req, res) => {
         theme: row.theme || row.cover_image,
         webShareUrl: createWebShareUrl(row.public_slug),
         createdAt: row.created_at,
+      })) });
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/admin/invitations") {
+      const user = resolveCurrentUser(req);
+      if (!user || user.email !== "ig29007@gmail.com") {
+        json(res, 403, { error: "Forbidden" });
+        return;
+      }
+      const rows = db.prepare(`
+        SELECT
+          i.id, i.share_token, i.public_slug, i.title, i.celebrant_name,
+          i.date, i.time, i.location, i.theme, i.cover_image,
+          i.created_at, i.updated_at,
+          COALESCE(au.email, hu.email, 'nepoznato') AS host_email,
+          COALESCE(au.display_name, hu.display_name, '') AS host_name,
+          (SELECT COUNT(*) FROM invitation_rsvps WHERE invitation_id = i.id) AS rsvp_count,
+          (SELECT COUNT(*) FROM invitation_membership_requests
+            WHERE invitation_id = i.id AND status = 'approved') AS guest_count
+        FROM invitations i
+        LEFT JOIN host_users hu ON hu.id = i.host_user_id
+        LEFT JOIN app_users au ON au.id = hu.app_user_id
+        ORDER BY i.created_at DESC
+      `).all();
+      json(res, 200, { invitations: rows.map((row) => ({
+        id: row.id,
+        shareToken: row.share_token,
+        publicSlug: row.public_slug,
+        title: row.title,
+        celebrantName: row.celebrant_name,
+        date: row.date,
+        time: row.time,
+        location: row.location,
+        theme: row.theme || row.cover_image || null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        hostEmail: row.host_email,
+        hostName: row.host_name,
+        rsvpCount: row.rsvp_count,
+        guestCount: row.guest_count,
       })) });
       return;
     }
