@@ -2844,6 +2844,38 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && pathname === "/api/admin/invitations/bulk-delete") {
+      const user = resolveCurrentUser(req);
+      if (!user || user.email !== "ig29007@gmail.com") {
+        json(res, 403, { error: "Forbidden" });
+        return;
+      }
+
+      const payload = await readJsonBody(req);
+      const rawIds = Array.isArray(payload?.ids) ? payload.ids : [];
+      const ids = [...new Set(rawIds.map((id) => getString(id)).filter(Boolean))];
+      if (ids.length === 0) {
+        json(res, 400, { error: "ids array is required" });
+        return;
+      }
+      if (ids.length > 300) {
+        json(res, 400, { error: "Too many ids" });
+        return;
+      }
+
+      const stmt = db.prepare("DELETE FROM invitations WHERE id = ?");
+      const deletedCount = db.transaction(() => {
+        let n = 0;
+        for (const id of ids) {
+          n += stmt.run(id).changes;
+        }
+        return n;
+      })();
+
+      json(res, 200, { deletedCount, requested: ids.length });
+      return;
+    }
+
     if (req.method === "GET" && pathname === "/api/my/rsvps") {
       const session = getSessionByToken(getBearerToken(req));
       if (!session) {
