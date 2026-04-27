@@ -872,6 +872,29 @@ function getFamilyProfileWithChildren(userId) {
   return { profile, children };
 }
 
+/** Ime oca/majke iz /moj-vidimose (family_profiles) za prikaz u chatu. */
+function getFamilyParentNameForChatUserId(userId) {
+  if (!userId) {
+    return null;
+  }
+  const direct = db.prepare("SELECT parent_name FROM family_profiles WHERE user_id = ?").get(userId);
+  const a = direct ? getString(direct.parent_name) : "";
+  if (a) {
+    return a;
+  }
+  const link = db.prepare("SELECT app_user_id FROM host_users WHERE id = ?").get(userId);
+  if (link?.app_user_id) {
+    const viaHost = db
+      .prepare("SELECT parent_name FROM family_profiles WHERE user_id = ?")
+      .get(link.app_user_id);
+    const b = viaHost ? getString(viaHost.parent_name) : "";
+    if (b) {
+      return b;
+    }
+  }
+  return null;
+}
+
 function serializeFamilyProfile(record) {
   if (!record) {
     return { profile: null, children: [] };
@@ -1559,12 +1582,13 @@ function getInvitationChatMessageById(messageId) {
 }
 
 function serializeInvitationChatMessage(message) {
+  const fromProfile = getFamilyParentNameForChatUserId(message.user_id);
   return {
     id: message.id,
     invitationId: message.invitation_id,
     userId: message.user_id,
     senderRole: message.sender_role,
-    senderName: message.sender_name,
+    senderName: fromProfile || message.sender_name,
     message: message.message,
     createdAt: message.created_at,
     updatedAt: message.updated_at,
@@ -1575,7 +1599,10 @@ function createInvitationChatMessage(invitation, currentUser, payload) {
   const messageId = randomId("chat");
   const timestamp = nowIso();
   const senderRole = isHostUser(invitation, currentUser) ? "host" : "guest";
-  const senderName = getString(currentUser.displayName) || (senderRole === "host" ? "Organizator" : "Gost");
+  const fromMojVidimose = getFamilyParentNameForChatUserId(currentUser.id);
+  const senderName = fromMojVidimose
+    ? fromMojVidimose
+    : getString(currentUser.displayName) || (senderRole === "host" ? "Organizator" : "Gost");
 
   db.prepare(
     `
@@ -1596,6 +1623,12 @@ function createInvitationChatMessage(invitation, currentUser, payload) {
   );
 
   return getInvitationChatMessageById(messageId);
+}
+
+function deleteInvitationChatMessage(invitationId, messageId) {
+  return db
+    .prepare("DELETE FROM invitation_chat_messages WHERE id = ? AND invitation_id = ?")
+    .run(messageId, invitationId);
 }
 
 function upsertRsvp(invitationId, userId, payload) {
@@ -2353,6 +2386,25 @@ const server = createServer(async (req, res) => {
       if (!requireHostAccess(res, invitation, currentUser)) return;
 
       json(res, 200, getInvitationHostSummary(invitation.id));
+      return;
+    }
+
+    const chatMessageDeleteMatch = pathname.match(/^\/api\/invitations\/([^/]+)\/chat\/([^/]+)$/);
+    if (chatMessageDeleteMatch && req.method === "DELETE") {
+      const currentUser = requireCurrentUser(req, res);
+      if (!currentUser) return;
+
+      const invitation = requireInvitationById(res, decodeURIComponent(chatMessageDeleteMatch[1]));
+      if (!invitation) return;
+      if (!requireHostAccess(res, invitation, currentUser)) return;
+
+      const messageId = decodeURIComponent(chatMessageDeleteMatch[2]);
+      const result = deleteInvitationChatMessage(invitation.id, messageId);
+      if (result.changes === 0) {
+        json(res, 404, { error: "Poruka nije pronađena" });
+        return;
+      }
+      json(res, 200, { ok: true });
       return;
     }
 
