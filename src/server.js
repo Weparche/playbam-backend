@@ -1647,9 +1647,9 @@ function createMembershipRequest(invitationId, userId, childIds) {
       INSERT INTO invitation_membership_requests (
         id, invitation_id, user_id, status, created_at, reviewed_at, reviewed_by_user_id
       )
-      VALUES (?, ?, ?, 'pending', ?, NULL, NULL)
+      VALUES (?, ?, ?, 'approved', ?, ?, NULL)
     `,
-  ).run(requestId, invitationId, userId, timestamp);
+  ).run(requestId, invitationId, userId, timestamp, timestamp);
 
   const insertMembershipChild = db.prepare(
     `
@@ -2511,12 +2511,13 @@ const server = createServer(async (req, res) => {
       }
 
       const existingRequest = getMembershipRequestForUser(invitation.id, currentUser.id);
-      if (existingRequest?.status === "pending") {
-        json(res, 409, { error: "Pending membership request already exists for this invitation" });
+      if (existingRequest?.status === "approved") {
+        json(res, 200, { request: serializeMembershipRequest(existingRequest) });
         return;
       }
-      if (existingRequest?.status === "approved") {
-        json(res, 409, { error: "Membership access has already been approved for this invitation" });
+      if (existingRequest?.status === "pending") {
+        const approved = reviewMembershipRequest(existingRequest, "approved", currentUser.id);
+        json(res, 200, { request: serializeMembershipRequest(approved) });
         return;
       }
 
