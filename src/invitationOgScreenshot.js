@@ -36,7 +36,6 @@ async function getBrowser() {
 export async function renderInvitationOgScreenshot(slug, webBaseUrl) {
   const origin = String(webBaseUrl ?? "https://vidimose.hr").replace(/\/$/, "");
   const captureUrl = `${origin}/pozivnica/${getCaptureSlug(slug)}?ogCapture=1`;
-  const chromium = await getChromium();
   const browser = await getBrowser();
   const context = await browser.newContext({
     viewport: CAPTURE_VIEWPORT,
@@ -47,9 +46,13 @@ export async function renderInvitationOgScreenshot(slug, webBaseUrl) {
   const page = await context.newPage();
 
   try {
-    await page.goto(captureUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    await page.goto(captureUrl, { waitUntil: "networkidle", timeout: 60_000 });
     await page.waitForSelector('[data-og-status="ready"]', { timeout: 30_000 });
     await page.waitForSelector(".pb-inviteCard--storybook", { state: "visible", timeout: 15_000 });
+    await page.waitForSelector(".pb-inviteHero__rsvpBlock--storybook", {
+      state: "visible",
+      timeout: 15_000,
+    });
     await page.waitForFunction(
       () => {
         const img = document.querySelector(".pb-inviteHero__image--storybook");
@@ -57,12 +60,31 @@ export async function renderInvitationOgScreenshot(slug, webBaseUrl) {
       },
       { timeout: 15_000 },
     );
+    await page.waitForFunction(
+      () => {
+        const buttons = document.querySelectorAll(
+          ".pb-inviteHero__rsvpButtons--storybook .pb-rsvpBtn--storybook",
+        );
+        if (buttons.length < 3) {
+          return false;
+        }
+        const emojiImgs = document.querySelectorAll(".pb-rsvpBtn__emoji--capture");
+        if (emojiImgs.length > 0) {
+          return [...emojiImgs].every(
+            (node) =>
+              node instanceof HTMLImageElement && node.complete && node.naturalWidth > 0,
+          );
+        }
+        return document.querySelectorAll(".pb-rsvpBtn__emoji").length >= 3;
+      },
+      { timeout: 20_000 },
+    );
     await page.evaluate(async () => {
       if (document.fonts?.ready) {
         await document.fonts.ready;
       }
     });
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(300);
 
     const cardPng = await page.locator(".pb-inviteCard--storybook").screenshot({
       type: "png",
