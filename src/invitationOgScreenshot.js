@@ -1,6 +1,8 @@
 import { compositeCardImageToOgFormat } from "./invitationOgComposite.js";
 
-const CAPTURE_VIEWPORT = { width: 430, height: 960 };
+/** Viewport × DPR ≈ 1200px širine kartice (manji screenshot → brži sharp). */
+const CAPTURE_VIEWPORT = { width: 600, height: 1334 };
+const CAPTURE_DEVICE_SCALE = 2;
 
 let browserPromise = null;
 
@@ -39,14 +41,14 @@ export async function renderInvitationOgScreenshot(slug, webBaseUrl) {
   const browser = await getBrowser();
   const context = await browser.newContext({
     viewport: CAPTURE_VIEWPORT,
-    deviceScaleFactor: 2,
+    deviceScaleFactor: CAPTURE_DEVICE_SCALE,
     locale: "hr-HR",
   });
 
   const page = await context.newPage();
 
   try {
-    await page.goto(captureUrl, { waitUntil: "networkidle", timeout: 60_000 });
+    await page.goto(captureUrl, { waitUntil: "load", timeout: 45_000 });
     await page.waitForSelector('[data-og-status="ready"]', { timeout: 30_000 });
     await page.waitForSelector(".pb-inviteCard--storybook", { state: "visible", timeout: 15_000 });
     await page.waitForSelector(".pb-inviteHero__rsvpBlock--storybook", {
@@ -84,14 +86,15 @@ export async function renderInvitationOgScreenshot(slug, webBaseUrl) {
         await document.fonts.ready;
       }
     });
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(200);
 
-    const cardPng = await page.locator(".pb-inviteCard--storybook").screenshot({
-      type: "png",
+    const cardJpeg = await page.locator(".pb-inviteCard--storybook").screenshot({
+      type: "jpeg",
+      quality: 84,
       animations: "disabled",
     });
 
-    return compositeCardImageToOgFormat(cardPng);
+    return compositeCardImageToOgFormat(cardJpeg);
   } finally {
     await context.close();
   }

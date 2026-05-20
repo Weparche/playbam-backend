@@ -2317,16 +2317,24 @@ const server = createServer(async (req, res) => {
       }
 
       try {
-        const png = await renderInvitationOgImage(
-          mapInvitationRowToPublic(invitation),
-          token,
-          WEB_BASE_URL,
-        );
+        const publicInvitation = mapInvitationRowToPublic(invitation);
+        const ogJpeg = await renderInvitationOgImage(publicInvitation, token, WEB_BASE_URL);
+        const etag = `"${publicInvitation.updatedAt ?? invitation.updated_at ?? ""}"`;
+        if (req.headers["if-none-match"] === etag) {
+          res.writeHead(304, {
+            ETag: etag,
+            "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+          });
+          res.end();
+          return;
+        }
         res.writeHead(200, {
-          "Content-Type": "image/png",
-          "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400",
+          "Content-Type": "image/jpeg",
+          "Content-Length": String(ogJpeg.length),
+          ETag: etag,
+          "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
         });
-        res.end(png);
+        res.end(ogJpeg);
       } catch (err) {
         console.error("OG image render failed", err);
         json(res, 500, { error: "OG image generation failed" });
