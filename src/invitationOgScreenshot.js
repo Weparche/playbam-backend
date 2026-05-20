@@ -1,10 +1,7 @@
 import { compositeCardImageToOgFormat } from "./invitationOgComposite.js";
 
-/** Viewport × DPR ≈ 1200px širine kartice (manji screenshot → brži sharp). */
 const CAPTURE_VIEWPORT = { width: 600, height: 1334 };
 const CAPTURE_DEVICE_SCALE = 2;
-
-let browserPromise = null;
 
 function getCaptureSlug(slug) {
   return encodeURIComponent(String(slug ?? "").trim());
@@ -20,25 +17,15 @@ async function getChromium() {
   return playwright.chromium;
 }
 
-async function getBrowser() {
-  if (!browserPromise) {
-    const chromium = await getChromium();
-    browserPromise = chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-    });
-  }
-  return browserPromise;
-}
-
-/**
- * Headless screenshot iste React pozivnice kao na /pozivnica/:slug (?ogCapture=1).
- * Zahtijeva: npm install playwright && npx playwright install chromium
- */
-export async function renderInvitationOgScreenshot(slug, webBaseUrl) {
+async function captureCardJpeg(slug, webBaseUrl) {
   const origin = String(webBaseUrl ?? "https://vidimose.hr").replace(/\/$/, "");
   const captureUrl = `${origin}/pozivnica/${getCaptureSlug(slug)}?ogCapture=1`;
-  const browser = await getBrowser();
+  const chromium = await getChromium();
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+  });
+
   const context = await browser.newContext({
     viewport: CAPTURE_VIEWPORT,
     deviceScaleFactor: CAPTURE_DEVICE_SCALE,
@@ -97,5 +84,14 @@ export async function renderInvitationOgScreenshot(slug, webBaseUrl) {
     return compositeCardImageToOgFormat(cardJpeg);
   } finally {
     await context.close();
+    await browser.close();
   }
+}
+
+/**
+ * Headless screenshot iste React pozivnice kao na /pozivnica/:slug (?ogCapture=1).
+ * Browser se zatvara nakon svakog rendera (ne drži Chromium u memoriji).
+ */
+export async function renderInvitationOgScreenshot(slug, webBaseUrl) {
+  return captureCardJpeg(slug, webBaseUrl);
 }
