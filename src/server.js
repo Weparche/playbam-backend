@@ -2570,9 +2570,17 @@ const server = createServer(async (req, res) => {
 
       const invitation = requireInvitationById(res, decodeURIComponent(membershipRequestsMatch[1]));
       if (!invitation) return;
-      if (!requireHostAccess(res, invitation, currentUser)) return;
 
-      json(res, 200, { requests: listMembershipRequestsForInvitation(invitation.id) });
+      if (isHostUser(invitation, currentUser)) {
+        json(res, 200, { requests: listMembershipRequestsForInvitation(invitation.id) });
+        return;
+      }
+
+      if (!requireApprovedInvitationAccess(res, invitation, currentUser)) return;
+
+      json(res, 200, {
+        requests: listMembershipRequestsForInvitation(invitation.id).filter((request) => request.status === "approved"),
+      });
       return;
     }
 
