@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = dirname(__dirname);
@@ -164,6 +164,15 @@ db.exec(`
     FOREIGN KEY (invitation_id) REFERENCES invitations(id) ON DELETE CASCADE
   );
 
+  CREATE TABLE IF NOT EXISTS invitation_chat_reads (
+    invitation_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    read_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (invitation_id, user_id),
+    FOREIGN KEY (invitation_id) REFERENCES invitations(id) ON DELETE CASCADE
+  );
+
   CREATE TABLE IF NOT EXISTS auth_otp_codes (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL,
@@ -268,13 +277,15 @@ function migrateFamilyChildrenOptionalFields() {
 
 migrateFamilyChildrenOptionalFields();
 
-const DEFAULT_HOST_TOKEN = process.env.PLAYBAM_HOST_AUTH_TOKEN ?? "playbam-dev-host-token";
-const HOST_USER_ID = "host-demo-ana";
-const HOST_EMAIL = "ana@vidimose.hr";
-const HOST_NAME = "Ana Horvat";
-const WEB_BASE_URL = (process.env.PLAYBAM_WEB_BASE_URL ?? "http://localhost:5173").replace(/\/$/, "");
 const PORT = Number(process.env.PORT ?? "4000");
+const WEB_BASE_URL = (process.env.PLAYBAM_WEB_BASE_URL ?? "http://localhost:5173").replace(/\/$/, "");
+const API_BASE_URL = (process.env.PLAYBAM_API_BASE_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID ?? "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET ?? "";
+const GOOGLE_OAUTH_REDIRECT_URI = process.env.GOOGLE_OAUTH_REDIRECT_URI ?? `${API_BASE_URL}/api/auth/google/callback`;
+const GOOGLE_OAUTH_STATE_SECRET =
+  process.env.GOOGLE_OAUTH_STATE_SECRET ?? "playbam-dev-google-oauth-state";
 
 const ALLOWED_ORIGINS = new Set([
   "https://vidimose.hr",
@@ -302,6 +313,121 @@ function generateOtp() {
 
 function hashOtp(code) {
   return createHash("sha256").update(code).digest("hex");
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value, "utf8").toString("base64url");
+}
+
+function base64UrlDecode(value) {
+  return Buffer.from(value, "base64url").toString("utf8");
+}
+
+function signGoogleAuthState(payload) {
+  const encoded = base64UrlEncode(JSON.stringify(payload));
+  const signature = createHmac("sha256", GOOGLE_OAUTH_STATE_SECRET).update(encoded).digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifyGoogleAuthState(state) {
+  const [encoded, signature] = getString(state).split(".");
+  if (!encoded || !signature) return null;
+
+  const expected = createHmac("sha256", GOOGLE_OAUTH_STATE_SECRET).update(encoded).digest("base64url");
+  if (signature.length !== expected.length || signature !== expected) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(base64UrlDecode(encoded));
+    if (!payload || typeof payload !== "object") return null;
+    if (typeof payload.returnTo !== "string" || typeof payload.exp !== "number") return null;
+    if (payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedReturnTo(returnTo) {
+  try {
+    const parsed = new URL(returnTo);
+    const allowed = new Set([
+      new URL(WEB_BASE_URL).origin,
+      "https://vidimose.hr",
+      "https://www.vidimose.hr",
+      "http://localhost:5173",
+      "http://localhost:4173",
+    ]);
+    return allowed.has(parsed.origin);
+  } catch {
+    return false;
+  }
+}
+
+function redirectWithGoogleAuthResult(res, returnTo, params) {
+  const fallbackUrl = `${WEB_BASE_URL}/`;
+  const target = isAllowedReturnTo(returnTo) ? returnTo : fallbackUrl;
+  const redirectUrl = new URL(target);
+  redirectUrl.searchParams.set("pbAuthProvider", "google");
+  redirectUrl.searchParams.set("pbAuthResult", "callback");
+
+  for (const [key, value] of Object.entries(params)) {
+    if (value != null && value !== "") {
+      redirectUrl.searchParams.set(key, value);
+    }
+  }
+
+  res.writeHead(302, {
+    Location: redirectUrl.toString(),
+    "Cache-Control": "no-store",
+  });
+  res.end();
+}
+
+async function fetchGoogleUser(code) {
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: GOOGLE_OAUTH_REDIRECT_URI,
+      grant_type: "authorization_code",
+    }),
+  });
+
+  if (!tokenResponse.ok) {
+    throw new Error("GOOGLE_TOKEN_EXCHANGE_FAILED");
+  }
+
+  const tokenPayload = await tokenResponse.json();
+  const accessToken = getString(tokenPayload.access_token);
+  if (!accessToken) {
+    throw new Error("GOOGLE_ACCESS_TOKEN_MISSING");
+  }
+
+  const userResponse = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  if (!userResponse.ok) {
+    throw new Error("GOOGLE_USERINFO_FAILED");
+  }
+
+  const userInfo = await userResponse.json();
+  const email = normalizeEmail(userInfo.email);
+  const emailVerified = userInfo.email_verified === true || userInfo.email_verified === "true";
+
+  if (!email || !emailVerified) {
+    throw new Error("GOOGLE_EMAIL_NOT_VERIFIED");
+  }
+
+  return {
+    email,
+    displayName: getString(userInfo.name) || displayNameFromEmail(email),
+  };
 }
 
 async function sendOtpEmail(email, code, displayName) {
@@ -741,6 +867,25 @@ function upsertAppUser(email, displayName) {
     displayName,
     createdAt: timestamp,
     updatedAt: timestamp,
+  };
+}
+
+function createAuthSession(email, displayName) {
+  const normalizedEmail = normalizeEmail(email);
+  const resolvedDisplayName = getString(displayName) || displayNameFromEmail(normalizedEmail);
+  const appUser = upsertAppUser(normalizedEmail, resolvedDisplayName);
+  const sessionToken = randomBytes(32).toString("base64url");
+  const sessionId = randomId("sess");
+  const sessionExpiresAt = Math.floor(Date.now() / 1000) + 30 * 24 * 3600;
+
+  db.prepare(
+    "INSERT INTO auth_sessions (id, token, email, display_name, app_user_id, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run(sessionId, sessionToken, normalizedEmail, resolvedDisplayName, appUser.id, sessionExpiresAt);
+
+  return {
+    token: sessionToken,
+    email: normalizedEmail,
+    displayName: resolvedDisplayName,
   };
 }
 
@@ -1571,6 +1716,49 @@ function getInvitationChatMessages(invitationId) {
   ).all(invitationId);
 }
 
+function isHostUserIdForInvitation(invitation, userId) {
+  if (!invitation || !userId) {
+    return false;
+  }
+  if (invitation.host_user_id === userId) {
+    return true;
+  }
+  const linked = db.prepare("SELECT id FROM host_users WHERE app_user_id = ?").get(userId);
+  return Boolean(linked && linked.id === invitation.host_user_id);
+}
+
+function getInvitationChatReads(invitationId) {
+  return db.prepare(
+    `
+      SELECT invitation_id, user_id, read_at, updated_at
+      FROM invitation_chat_reads
+      WHERE invitation_id = ?
+    `,
+  ).all(invitationId);
+}
+
+function serializeInvitationChatRead(invitation, read) {
+  return {
+    userId: read.user_id,
+    readAt: read.read_at,
+    isHost: isHostUserIdForInvitation(invitation, read.user_id),
+  };
+}
+
+function upsertInvitationChatRead(invitationId, userId) {
+  const timestamp = nowIso();
+  db.prepare(
+    `
+      INSERT INTO invitation_chat_reads (invitation_id, user_id, read_at, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(invitation_id, user_id) DO UPDATE SET
+        read_at = excluded.read_at,
+        updated_at = excluded.updated_at
+    `,
+  ).run(invitationId, userId, timestamp, timestamp);
+  return timestamp;
+}
+
 function getInvitationChatMessageById(messageId) {
   return db.prepare(
     `
@@ -1718,66 +1906,6 @@ function requireHostAccess(res, invitation, currentUser) {
   }
   return true;
 }
-
-function seedDefaultHostUser() {
-  const existing = db.prepare("SELECT id FROM host_users WHERE id = ?").get(HOST_USER_ID);
-  if (existing) {
-    return;
-  }
-
-  db.prepare(
-    `
-      INSERT INTO host_users (id, auth_token_hash, email, display_name, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `,
-  ).run(HOST_USER_ID, hashToken(DEFAULT_HOST_TOKEN), HOST_EMAIL, HOST_NAME, nowIso());
-}
-
-seedDefaultHostUser();
-
-/** Demo pozivnica za web (/pozivnica/luka-istrazivaci) i /pozivnica-demo. */
-function seedDemoInvitation() {
-  const publicSlug = "luka-istrazivaci";
-  const existing = db.prepare("SELECT id FROM invitations WHERE public_slug = ?").get(publicSlug);
-  if (existing) {
-    return;
-  }
-
-  const invitationId = "inv_demo_luka_istrazivaci";
-  const shareToken = publicSlug;
-  const timestamp = nowIso();
-
-  db.prepare(
-    `
-      INSERT INTO invitations (
-        id, host_user_id, share_token, public_slug, title, celebrant_name, title_font, title_color, title_outline, title_size, date, time,
-        location, message, cover_image, theme, created_at, updated_at
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-  ).run(
-    invitationId,
-    HOST_USER_ID,
-    shareToken,
-    publicSlug,
-    "Luka istražuje svemir",
-    "Luka",
-    "lilita",
-    "playbam-blue",
-    "soft",
-    "md",
-    "2026-06-15",
-    "15:00",
-    "Happy Land, Lastovska 2, Zagreb",
-    "Veselimo se druženju!",
-    "baloni",
-    "baloni",
-    timestamp,
-    timestamp,
-  );
-}
-
-seedDemoInvitation();
 
 // ---------------------------------------------------------------------------
 // Link unfurl / Open Graph metadata extraction
@@ -2093,18 +2221,25 @@ const server = createServer(async (req, res) => {
   try {
     if (req.method === "POST" && pathname === "/api/invitations") {
       const bearerToken = getBearerToken(req);
-      let hostUser = { id: HOST_USER_ID };
-      if (bearerToken) {
-        const sess = getSessionByToken(bearerToken);
-        if (sess) {
-          hostUser = findOrCreateHostUserByEmail(sess.email, sess.display_name);
-          // Link app_user_id to host_users record if not already set
-          if (hostUser.id && sess.app_user_id) {
-            db.prepare("UPDATE host_users SET app_user_id = ? WHERE id = ? AND app_user_id IS NULL").run(sess.app_user_id, hostUser.id);
-          }
-        } else {
-          hostUser = getHostUserByToken(bearerToken) ?? hostUser;
+      if (!bearerToken) {
+        json(res, 401, { error: "Authentication required" });
+        return;
+      }
+
+      let hostUser = null;
+      const sess = getSessionByToken(bearerToken);
+      if (sess) {
+        hostUser = findOrCreateHostUserByEmail(sess.email, sess.display_name);
+        if (hostUser.id && sess.app_user_id) {
+          db.prepare("UPDATE host_users SET app_user_id = ? WHERE id = ? AND app_user_id IS NULL").run(sess.app_user_id, hostUser.id);
         }
+      } else {
+        hostUser = getHostUserByToken(bearerToken);
+      }
+
+      if (!hostUser) {
+        json(res, 401, { error: "Invalid or expired token" });
+        return;
       }
 
       const payload = await readJsonBody(req);
@@ -2163,7 +2298,7 @@ const server = createServer(async (req, res) => {
         shareToken,
         publicSlug,
         webShareUrl: createWebShareUrl(publicSlug),
-        hostAuthToken: bearerToken || DEFAULT_HOST_TOKEN,
+        hostAuthToken: bearerToken,
       });
       return;
     }
@@ -2419,7 +2554,22 @@ const server = createServer(async (req, res) => {
 
       json(res, 200, {
         messages: getInvitationChatMessages(invitation.id).map(serializeInvitationChatMessage),
+        reads: getInvitationChatReads(invitation.id).map((read) => serializeInvitationChatRead(invitation, read)),
       });
+      return;
+    }
+
+    const chatReadMatch = pathname.match(/^\/api\/invitations\/([^/]+)\/chat\/read$/);
+    if (chatReadMatch && req.method === "POST") {
+      const currentUser = requireCurrentUser(req, res);
+      if (!currentUser) return;
+
+      const invitation = requireInvitationById(res, decodeURIComponent(chatReadMatch[1]));
+      if (!invitation) return;
+      if (!requireApprovedInvitationAccess(res, invitation, currentUser)) return;
+
+      const readAt = upsertInvitationChatRead(invitation.id, currentUser.id);
+      json(res, 200, { readAt, userId: currentUser.id, isHost: isHostUserIdForInvitation(invitation, currentUser.id) });
       return;
     }
 
@@ -2743,6 +2893,89 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "GET" && pathname === "/api/auth/google/start") {
+      const returnTo = url.searchParams.get("returnTo") || `${WEB_BASE_URL}/`;
+      if (!isAllowedReturnTo(returnTo)) {
+        json(res, 400, { error: "Neispravan Google povratni URL" });
+        return;
+      }
+      if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+        const modal = new URL(returnTo).searchParams.get("pbAuthModal") || "otp";
+        redirectWithGoogleAuthResult(res, returnTo, {
+          pbAuthModal: modal,
+          pbAuthError: "Google prijava nije konfigurirana.",
+        });
+        return;
+      }
+
+      const state = signGoogleAuthState({
+        returnTo,
+        exp: Math.floor(Date.now() / 1000) + 10 * 60,
+        nonce: randomBytes(16).toString("base64url"),
+      });
+      const googleUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+      googleUrl.searchParams.set("client_id", GOOGLE_CLIENT_ID);
+      googleUrl.searchParams.set("redirect_uri", GOOGLE_OAUTH_REDIRECT_URI);
+      googleUrl.searchParams.set("response_type", "code");
+      googleUrl.searchParams.set("scope", "openid email profile");
+      googleUrl.searchParams.set("state", state);
+      googleUrl.searchParams.set("prompt", "select_account");
+
+      res.writeHead(302, {
+        Location: googleUrl.toString(),
+        "Cache-Control": "no-store",
+      });
+      res.end();
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/auth/google/callback") {
+      const state = verifyGoogleAuthState(url.searchParams.get("state"));
+      const returnTo = state?.returnTo || `${WEB_BASE_URL}/`;
+      const modal = (() => {
+        try {
+          return new URL(returnTo).searchParams.get("pbAuthModal") || "otp";
+        } catch {
+          return "otp";
+        }
+      })();
+      const googleError = url.searchParams.get("error");
+      const code = url.searchParams.get("code");
+
+      if (!state) {
+        redirectWithGoogleAuthResult(res, returnTo, {
+          pbAuthModal: modal,
+          pbAuthError: "Google prijava je istekla. Pokušaj ponovno.",
+        });
+        return;
+      }
+      if (googleError || !code) {
+        redirectWithGoogleAuthResult(res, returnTo, {
+          pbAuthModal: modal,
+          pbAuthError: "Google prijava je otkazana ili nije uspjela.",
+        });
+        return;
+      }
+
+      try {
+        const googleUser = await fetchGoogleUser(code);
+        const session = createAuthSession(googleUser.email, googleUser.displayName);
+        redirectWithGoogleAuthResult(res, returnTo, {
+          pbAuthModal: modal,
+          pbAuthToken: session.token,
+          pbAuthEmail: session.email,
+          pbAuthDisplayName: session.displayName,
+        });
+      } catch (err) {
+        console.error("Google OAuth failed", err);
+        redirectWithGoogleAuthResult(res, returnTo, {
+          pbAuthModal: modal,
+          pbAuthError: "Google prijava trenutno nije uspjela. Pokušaj ponovno.",
+        });
+      }
+      return;
+    }
+
     if (req.method === "POST" && pathname === "/api/auth/send-otp") {
       const { email: rawEmail, name: rawName } = await readJsonBody(req);
       const email = normalizeEmail(rawEmail);
@@ -2792,16 +3025,7 @@ const server = createServer(async (req, res) => {
 
       db.prepare("UPDATE auth_otp_codes SET used = 1 WHERE id = ?").run(otpRecord.id);
 
-      const appUser = upsertAppUser(email, otpRecord.display_name);
-      const sessionToken = randomBytes(32).toString("base64url");
-      const sessionId = randomId("sess");
-      const sessionExpiresAt = now + 30 * 24 * 3600;
-
-      db.prepare(
-        "INSERT INTO auth_sessions (id, token, email, display_name, app_user_id, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-      ).run(sessionId, sessionToken, email, otpRecord.display_name, appUser.id, sessionExpiresAt);
-
-      json(res, 200, { token: sessionToken, email, displayName: otpRecord.display_name });
+      json(res, 200, createAuthSession(email, otpRecord.display_name));
       return;
     }
 
@@ -3027,6 +3251,5 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Playbam backend listening on http://localhost:${PORT}`);
-  console.log(`Seed host token: ${DEFAULT_HOST_TOKEN}`);
   console.log("Temporary web identity headers: X-Playbam-User-Email, X-Playbam-User-Name");
 });
