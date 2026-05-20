@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import dotenv from "dotenv";
+import { renderInvitationOgPng } from "./invitationOgImage.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = dirname(__dirname);
@@ -2302,6 +2303,29 @@ const server = createServer(async (req, res) => {
         webShareUrl: createWebShareUrl(publicSlug),
         hostAuthToken: bearerToken,
       });
+      return;
+    }
+
+    const publicOgMatch = pathname.match(/^\/api\/public\/invitations\/([^/]+)\/og\.png$/i);
+    if (req.method === "GET" && publicOgMatch) {
+      const token = decodeURIComponent(publicOgMatch[1]);
+      const invitation = findInvitationByToken(token);
+      if (!invitation) {
+        json(res, 404, { error: "Invitation not found" });
+        return;
+      }
+
+      try {
+        const png = await renderInvitationOgPng(mapInvitationRowToPublic(invitation), WEB_BASE_URL);
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400",
+        });
+        res.end(png);
+      } catch (err) {
+        console.error("OG image render failed", err);
+        json(res, 500, { error: "OG image generation failed" });
+      }
       return;
     }
 
