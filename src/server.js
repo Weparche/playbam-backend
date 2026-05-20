@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import dotenv from "dotenv";
-import { renderInvitationOgPng } from "./invitationOgImage.js";
+import { renderInvitationOgImage } from "./invitationOgRender.js";
+import { parseImageDataUrl, saveInvitationOgImage } from "./invitationOgStorage.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = dirname(__dirname);
@@ -2316,7 +2317,11 @@ const server = createServer(async (req, res) => {
       }
 
       try {
-        const png = await renderInvitationOgPng(mapInvitationRowToPublic(invitation), WEB_BASE_URL);
+        const png = await renderInvitationOgImage(
+          mapInvitationRowToPublic(invitation),
+          token,
+          WEB_BASE_URL,
+        );
         res.writeHead(200, {
           "Content-Type": "image/png",
           "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400",
@@ -2343,6 +2348,31 @@ const server = createServer(async (req, res) => {
       }
 
       json(res, 200, mapInvitationRowToPublic(invitation));
+      return;
+    }
+
+    const invitationOgImageMatch = pathname.match(/^\/api\/invitations\/([^/]+)\/og-image$/);
+    if (invitationOgImageMatch && req.method === "POST") {
+      const currentUser = requireCurrentUser(req, res);
+      if (!currentUser) return;
+
+      const invitation = requireInvitationById(res, decodeURIComponent(invitationOgImageMatch[1]));
+      if (!invitation) return;
+      if (!requireHostAccess(res, invitation, currentUser)) return;
+
+      const payload = await readJsonBody(req);
+      const imageBuffer = parseImageDataUrl(payload?.imageDataUrl ?? payload?.image);
+      if (!imageBuffer || imageBuffer.length < 64) {
+        json(res, 400, { error: "imageDataUrl (JPEG base64) is required" });
+        return;
+      }
+      if (imageBuffer.length > 2_500_000) {
+        json(res, 400, { error: "OG image is too large (max ~2.5 MB)" });
+        return;
+      }
+
+      saveInvitationOgImage(invitation.id, imageBuffer);
+      json(res, 200, { ok: true, invitationId: invitation.id });
       return;
     }
 
