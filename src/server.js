@@ -4,9 +4,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, createHmac, randomBytes } from "node:crypto";
+import dotenv from "dotenv";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = dirname(__dirname);
+dotenv.config({ path: join(rootDir, ".env") });
 const dataDir = join(rootDir, "data");
 const dbPath = join(dataDir, "playbam.sqlite");
 
