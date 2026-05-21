@@ -1,6 +1,6 @@
 const PLACES_API_BASE = "https://places.googleapis.com/v1";
 const DEFAULT_TIMEOUT_MS = 6000;
-const DEFAULT_CAFE_RADIUS_METERS = 650;
+const DEFAULT_CAFE_RADIUS_METERS = 1500;
 const MAX_CAFE_RESULTS = 8;
 
 function getApiKey() {
