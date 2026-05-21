@@ -3029,6 +3029,57 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && pathname === "/api/places/covers") {
+      try {
+        const body = await readJsonBody(req);
+        const places = Array.isArray(body.places) ? body.places.slice(0, 80) : [];
+
+        if (!Array.isArray(body.places)) {
+          json(res, 400, { error: "places array is required" });
+          return;
+        }
+
+        const covers = {};
+        let cursor = 0;
+        const workerCount = Math.min(5, places.length);
+
+        await Promise.all(
+          Array.from({ length: workerCount }, async () => {
+            for (;;) {
+              const index = cursor;
+              cursor += 1;
+              if (index >= places.length) return;
+
+              const item = places[index] || {};
+              const id = typeof item.id === "string" ? item.id.trim() : "";
+              const name = typeof item.name === "string" ? item.name.trim() : "";
+              if (!id || !name) continue;
+
+              try {
+                const result = await enrichPlace({
+                  query: [name, item.address, item.city, "Hrvatska"].filter(Boolean).join(" "),
+                  placeId: item.googlePlaceId,
+                  lat: item.lat,
+                  lng: item.lng,
+                  languageCode: "hr",
+                  maxPhotos: 1,
+                });
+                const photo = result?.place?.photos?.find((entry) => entry?.uri)?.uri || null;
+                covers[id] = photo;
+              } catch {
+                covers[id] = null;
+              }
+            }
+          }),
+        );
+
+        json(res, 200, { covers });
+      } catch (err) {
+        json(res, err.status || 502, { error: err.message || "Google Places covers request failed" });
+      }
+      return;
+    }
+
     if (req.method === "GET" && pathname === "/api/auth/google/start") {
       const returnTo = url.searchParams.get("returnTo") || `${WEB_BASE_URL}/`;
       if (!isAllowedReturnTo(returnTo)) {
