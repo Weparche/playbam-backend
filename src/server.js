@@ -7,7 +7,7 @@ import { createHash, createHmac, randomBytes } from "node:crypto";
 import dotenv from "dotenv";
 import { renderInvitationOgImage } from "./invitationOgRender.js";
 import { parseImageDataUrl, saveInvitationOgImage } from "./invitationOgStorage.js";
-import { getPlacePhotoUri, searchNearbyCafes } from "./googlePlaces.js";
+import { enrichPlace, getPlaceDetails, getPlacePhotoUri, searchNearbyCafes } from "./googlePlaces.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = dirname(__dirname);
@@ -2993,6 +2993,38 @@ const server = createServer(async (req, res) => {
         json(res, 200, result);
       } catch (err) {
         json(res, err.status || 502, { error: err.message || "Google Places photo request failed" });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/places/details") {
+      try {
+        const result = await getPlaceDetails({
+          placeId: url.searchParams.get("placeId") || url.searchParams.get("id"),
+          languageCode: url.searchParams.get("languageCode") || "hr",
+          maxPhotos: url.searchParams.get("maxPhotos"),
+        });
+        json(res, 200, result);
+      } catch (err) {
+        json(res, err.status || 502, { error: err.message || "Google Places details request failed" });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/places/enrich") {
+      try {
+        const result = await enrichPlace({
+          query: url.searchParams.get("query"),
+          placeId: url.searchParams.get("placeId"),
+          lat: url.searchParams.get("lat"),
+          lng: url.searchParams.get("lng"),
+          radiusMeters: url.searchParams.get("radiusMeters"),
+          languageCode: url.searchParams.get("languageCode") || "hr",
+          maxPhotos: url.searchParams.get("maxPhotos"),
+        });
+        json(res, 200, result);
+      } catch (err) {
+        json(res, err.status || 502, { error: err.message || "Google Places enrichment request failed" });
       }
       return;
     }

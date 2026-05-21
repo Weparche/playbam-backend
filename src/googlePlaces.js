@@ -2,6 +2,9 @@ const PLACES_API_BASE = "https://places.googleapis.com/v1";
 const DEFAULT_TIMEOUT_MS = 6000;
 const DEFAULT_CAFE_RADIUS_METERS = 1500;
 const MAX_CAFE_RESULTS = 8;
+const MAX_PHOTO_RESULTS = 8;
+const PLACE_CACHE_TTL_MS = 1000 * 60 * 60 * 24;
+const placeCache = new Map();
 
 function getApiKey() {
   return process.env.GOOGLE_PLACES_API_KEY || process.env.GOOGLE_MAPS_API_KEY || "";
@@ -15,6 +18,24 @@ function clampNumber(value, min, max, fallback) {
 
 function getText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function getCache(key) {
+  const cached = placeCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.ts > PLACE_CACHE_TTL_MS) {
+    placeCache.delete(key);
+    return null;
+  }
+  return cached.data;
+}
+
+function setCache(key, data) {
+  placeCache.set(key, { ts: Date.now(), data });
+  if (placeCache.size > 500) {
+    const oldestKey = placeCache.keys().next().value;
+    if (oldestKey) placeCache.delete(oldestKey);
+  }
 }
 
 function metersBetween(a, b) {
@@ -76,6 +97,57 @@ function normalizePlace(place, origin) {
           photoUri: getText(attr.photoUri) || null,
         }))
       : [],
+  };
+}
+
+function normalizeOpeningHours(hours) {
+  if (!hours || typeof hours !== "object") return null;
+  return {
+    openNow: typeof hours.openNow === "boolean" ? hours.openNow : null,
+    weekdayDescriptions: Array.isArray(hours.weekdayDescriptions) ? hours.weekdayDescriptions.filter(Boolean) : [],
+  };
+}
+
+function normalizeRichPlace(place, photoUris = []) {
+  const location = place?.location;
+  const lat = Number(location?.latitude);
+  const lng = Number(location?.longitude);
+  const photos = Array.isArray(place.photos) ? place.photos : [];
+
+  return {
+    id: getText(place.id) || getText(place.name).replace(/^places\//, ""),
+    placeId: getText(place.id) || getText(place.name).replace(/^places\//, ""),
+    resourceName: getText(place.name) || null,
+    name: getText(place.displayName?.text) || null,
+    address: getText(place.formattedAddress) || getText(place.shortFormattedAddress) || null,
+    shortAddress: getText(place.shortFormattedAddress) || null,
+    lat: Number.isFinite(lat) ? lat : null,
+    lng: Number.isFinite(lng) ? lng : null,
+    rating: typeof place.rating === "number" ? place.rating : null,
+    reviewCount: Number.isInteger(place.userRatingCount) ? place.userRatingCount : null,
+    phone: getText(place.internationalPhoneNumber) || getText(place.nationalPhoneNumber) || null,
+    website: getText(place.websiteUri) || null,
+    googleMapsUri: getText(place.googleMapsUri) || null,
+    businessStatus: getText(place.businessStatus) || null,
+    types: Array.isArray(place.types) ? place.types.filter(Boolean) : [],
+    primaryType: getText(place.primaryType) || null,
+    goodForChildren: typeof place.goodForChildren === "boolean" ? place.goodForChildren : null,
+    restroom: typeof place.restroom === "boolean" ? place.restroom : null,
+    regularOpeningHours: normalizeOpeningHours(place.regularOpeningHours),
+    currentOpeningHours: normalizeOpeningHours(place.currentOpeningHours),
+    photos: photos.map((photo, index) => ({
+      name: getText(photo.name) || null,
+      widthPx: Number.isFinite(Number(photo.widthPx)) ? Number(photo.widthPx) : null,
+      heightPx: Number.isFinite(Number(photo.heightPx)) ? Number(photo.heightPx) : null,
+      uri: photoUris[index] || null,
+      attributions: Array.isArray(photo.authorAttributions)
+        ? photo.authorAttributions.map((attr) => ({
+            displayName: getText(attr.displayName) || null,
+            uri: getText(attr.uri) || null,
+            photoUri: getText(attr.photoUri) || null,
+          }))
+        : [],
+    })),
   };
 }
 
@@ -187,4 +259,176 @@ export async function getPlacePhotoUri({ name, maxWidthPx, maxHeightPx }) {
     photoUri: getText(payload.photoUri) || null,
     source: "google_places",
   };
+}
+
+async function resolvePhotoUris(photos, maxPhotos) {
+  const limited = (Array.isArray(photos) ? photos : [])
+    .map((photo) => getText(photo.name))
+    .filter(Boolean)
+    .slice(0, Math.round(clampNumber(maxPhotos, 0, MAX_PHOTO_RESULTS, 5)));
+
+  const results = await Promise.all(
+    limited.map((name) =>
+      getPlacePhotoUri({ name, maxWidthPx: 1200, maxHeightPx: 900 })
+        .then((photo) => photo.photoUri)
+        .catch(() => null),
+    ),
+  );
+
+  return results;
+}
+
+export async function findPlaceByText({ query, lat, lng, radiusMeters, languageCode = "hr" }) {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    const error = new Error("GOOGLE_PLACES_API_KEY is not configured");
+    error.status = 503;
+    throw error;
+  }
+
+  const textQuery = getText(query);
+  if (!textQuery) {
+    const error = new Error("query is required");
+    error.status = 400;
+    throw error;
+  }
+
+  const body = {
+    textQuery,
+    maxResultCount: 1,
+    languageCode: getText(languageCode) || "hr",
+  };
+
+  const center = {
+    lat: clampNumber(lat, -90, 90, null),
+    lng: clampNumber(lng, -180, 180, null),
+  };
+
+  if (center.lat != null && center.lng != null) {
+    body.locationBias = {
+      circle: {
+        center: {
+          latitude: center.lat,
+          longitude: center.lng,
+        },
+        radius: clampNumber(radiusMeters, 100, 10000, 2500),
+      },
+    };
+  }
+
+  const response = await fetchWithTimeout(`${PLACES_API_BASE}/places:searchText`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": apiKey,
+      "X-Goog-FieldMask": [
+        "places.id",
+        "places.name",
+        "places.displayName",
+        "places.formattedAddress",
+        "places.shortFormattedAddress",
+        "places.location",
+        "places.googleMapsUri",
+        "places.rating",
+        "places.userRatingCount",
+      ].join(","),
+    },
+    body: JSON.stringify(body),
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload?.error?.message || "Google Places text search failed");
+    error.status = response.status;
+    throw error;
+  }
+
+  return Array.isArray(payload.places) ? payload.places[0] ?? null : null;
+}
+
+export async function getPlaceDetails({ placeId, languageCode = "hr", maxPhotos = 5 }) {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    const error = new Error("GOOGLE_PLACES_API_KEY is not configured");
+    error.status = 503;
+    throw error;
+  }
+
+  const id = getText(placeId).replace(/^places\//, "");
+  if (!id) {
+    const error = new Error("placeId is required");
+    error.status = 400;
+    throw error;
+  }
+
+  const cacheKey = `details:${id}:${languageCode}:${maxPhotos}`;
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
+
+  const url = new URL(`${PLACES_API_BASE}/places/${encodeURIComponent(id)}`);
+  url.searchParams.set("languageCode", getText(languageCode) || "hr");
+
+  const response = await fetchWithTimeout(url.toString(), {
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": apiKey,
+      "X-Goog-FieldMask": [
+        "id",
+        "name",
+        "displayName",
+        "formattedAddress",
+        "shortFormattedAddress",
+        "location",
+        "googleMapsUri",
+        "internationalPhoneNumber",
+        "nationalPhoneNumber",
+        "websiteUri",
+        "rating",
+        "userRatingCount",
+        "regularOpeningHours",
+        "currentOpeningHours",
+        "businessStatus",
+        "types",
+        "primaryType",
+        "photos",
+      ].join(","),
+    },
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload?.error?.message || "Google Places details failed");
+    error.status = response.status;
+    throw error;
+  }
+
+  const photoUris = await resolvePhotoUris(payload.photos, maxPhotos);
+  const result = {
+    place: normalizeRichPlace(payload, photoUris),
+    source: "google_places",
+  };
+  setCache(cacheKey, result);
+  return result;
+}
+
+export async function enrichPlace({ query, placeId, lat, lng, radiusMeters, languageCode = "hr", maxPhotos = 5 }) {
+  const normalizedPlaceId = getText(placeId).replace(/^places\//, "");
+  const textQuery = getText(query);
+  const cacheKey = `enrich:${normalizedPlaceId || textQuery}:${lat ?? ""}:${lng ?? ""}:${languageCode}:${maxPhotos}`;
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
+
+  const foundPlace = normalizedPlaceId
+    ? { id: normalizedPlaceId }
+    : await findPlaceByText({ query: textQuery, lat, lng, radiusMeters, languageCode });
+
+  if (!foundPlace?.id) {
+    const result = { place: null, source: "google_places" };
+    setCache(cacheKey, result);
+    return result;
+  }
+
+  const result = await getPlaceDetails({ placeId: foundPlace.id, languageCode, maxPhotos });
+  setCache(cacheKey, result);
+  return result;
 }
