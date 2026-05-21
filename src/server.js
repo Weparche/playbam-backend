@@ -7,6 +7,7 @@ import { createHash, createHmac, randomBytes } from "node:crypto";
 import dotenv from "dotenv";
 import { renderInvitationOgImage } from "./invitationOgRender.js";
 import { parseImageDataUrl, saveInvitationOgImage } from "./invitationOgStorage.js";
+import { getPlacePhotoUri, searchNearbyCafes } from "./googlePlaces.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = dirname(__dirname);
@@ -2962,6 +2963,36 @@ const server = createServer(async (req, res) => {
         json(res, 200, result);
       } catch {
         json(res, 200, { title: null, image: null, domain: null, favicon: null });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/places/nearby-cafes") {
+      try {
+        const result = await searchNearbyCafes({
+          lat: url.searchParams.get("lat"),
+          lng: url.searchParams.get("lng"),
+          radiusMeters: url.searchParams.get("radiusMeters"),
+          maxResultCount: url.searchParams.get("maxResultCount"),
+          languageCode: url.searchParams.get("languageCode") || "hr",
+        });
+        json(res, 200, result);
+      } catch (err) {
+        json(res, err.status || 502, { error: err.message || "Google Places request failed" });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/places/photo-uri") {
+      try {
+        const result = await getPlacePhotoUri({
+          name: url.searchParams.get("name"),
+          maxWidthPx: url.searchParams.get("maxWidthPx"),
+          maxHeightPx: url.searchParams.get("maxHeightPx"),
+        });
+        json(res, 200, result);
+      } catch (err) {
+        json(res, err.status || 502, { error: err.message || "Google Places photo request failed" });
       }
       return;
     }
