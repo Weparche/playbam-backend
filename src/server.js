@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import dotenv from "dotenv";
 import { renderInvitationOgImage } from "./invitationOgRender.js";
+import { renderInvitationShareVideo } from "./invitationVideoRender.js";
 import { parseImageDataUrl, saveInvitationOgImage } from "./invitationOgStorage.js";
 import { enrichPlace, getPlaceDetails, getPlacePhotoUri, searchNearbyCafes } from "./googlePlaces.js";
 
@@ -2382,6 +2383,35 @@ const server = createServer(async (req, res) => {
 
       saveInvitationOgImage(invitation.id, imageBuffer);
       json(res, 200, { ok: true, invitationId: invitation.id });
+      return;
+    }
+
+    const invitationVideoExportMatch = pathname.match(/^\/api\/invitations\/([^/]+)\/video-export\.mp4$/);
+    if (invitationVideoExportMatch && req.method === "GET") {
+      const currentUser = requireCurrentUser(req, res);
+      if (!currentUser) return;
+
+      const invitation = requireInvitationById(res, decodeURIComponent(invitationVideoExportMatch[1]));
+      if (!invitation) return;
+      if (!requireHostAccess(res, invitation, currentUser)) return;
+
+      try {
+        const token = getInvitationPublicSlug(invitation) || invitation.share_token;
+        const videoBuffer = await renderInvitationShareVideo(token, WEB_BASE_URL);
+        res.writeHead(200, {
+          "Content-Type": "video/mp4",
+          "Content-Length": String(videoBuffer.length),
+          "Content-Disposition": 'attachment; filename="pozivnica.mp4"',
+          "Access-Control-Allow-Origin": getCorsOrigin(req),
+          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Playbam-User-Email, X-Playbam-User-Name",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Cache-Control": "no-store",
+        });
+        res.end(videoBuffer);
+      } catch (err) {
+        console.error("Invitation video export failed", err);
+        json(res, 500, { error: "Video export failed" });
+      }
       return;
     }
 

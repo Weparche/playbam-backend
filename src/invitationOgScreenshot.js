@@ -44,8 +44,14 @@ async function captureCardJpeg(slug, webBaseUrl) {
     });
     await page.waitForFunction(
       () => {
-        const img = document.querySelector(".pb-inviteHero__image--storybook");
-        return img instanceof HTMLImageElement && img.complete && img.naturalWidth > 0;
+        const media = document.querySelector(".pb-inviteHero__image--storybook");
+        if (media instanceof HTMLImageElement) {
+          return media.complete && media.naturalWidth > 0;
+        }
+        if (media instanceof HTMLVideoElement) {
+          return media.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && media.videoWidth > 0;
+        }
+        return false;
       },
       { timeout: 15_000 },
     );
