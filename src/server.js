@@ -970,10 +970,10 @@ function findInvitationByToken(token) {
           , parking_location, cafe_location, extra_details, contact_name, contact_mobile
           , wishlist_keks_pay_url, wishlist_bank_iban, wishlist_payment_image_url, rsvp_mood
           FROM invitations
-          WHERE share_token = ? OR public_slug = ?
+          WHERE share_token = ? OR public_slug = ? OR id = ?
         `,
       )
-      .get(token, token) ?? null
+      .get(token, token, token) ?? null
   );
 }
 
