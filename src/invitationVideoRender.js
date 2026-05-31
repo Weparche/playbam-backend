@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import ffmpegPath from "ffmpeg-static";
 
-const CAPTURE_VIEWPORT = { width: 760, height: 1300 };
+const CAPTURE_VIEWPORT = { width: 760, height: 1296 };
+const RECORD_VIDEO_SIZE = { width: 760, height: 1296 };
 const VIDEO_DURATION_MS = 6000;
 
 function getCaptureSlug(slug) {
@@ -46,7 +47,7 @@ function runFfmpeg(args) {
 
 async function renderPageRecording(slug, webBaseUrl, outputDir) {
   const origin = String(webBaseUrl ?? "https://vidimose.hr").replace(/\/$/, "");
-  const captureUrl = `${origin}/pozivnica/${getCaptureSlug(slug)}?ogCapture=1`;
+  const captureUrl = `${origin}/pozivnica/${getCaptureSlug(slug)}?ogCapture=1&videoCapture=1`;
   const chromium = await getChromium();
   const browser = await chromium.launch({
     headless: true,
@@ -59,7 +60,7 @@ async function renderPageRecording(slug, webBaseUrl, outputDir) {
     locale: "hr-HR",
     recordVideo: {
       dir: outputDir,
-      size: CAPTURE_VIEWPORT,
+      size: RECORD_VIDEO_SIZE,
     },
   });
 
@@ -94,6 +95,7 @@ async function renderPageRecording(slug, webBaseUrl, outputDir) {
         await video.play().catch(() => undefined);
       }
     });
+    await page.waitForTimeout(1000);
     await page.waitForTimeout(VIDEO_DURATION_MS);
     const video = page.video();
     await context.close();
@@ -117,6 +119,8 @@ export async function renderInvitationShareVideo(slug, webBaseUrl) {
     const recordedWebmPath = await renderPageRecording(slug, webBaseUrl, tempDir);
     await runFfmpeg([
       "-y",
+      "-sseof",
+      `-${VIDEO_DURATION_MS / 1000}`,
       "-i",
       recordedWebmPath,
       "-t",
