@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -22,12 +22,12 @@ async function getChromium() {
 }
 
 function runFfmpeg(args) {
-  if (!ffmpegPath) {
-    throw new Error("FFMPEG_NOT_INSTALLED");
-  }
+  const executable =
+    process.env.FFMPEG_PATH ||
+    (ffmpegPath && existsSync(ffmpegPath) ? ffmpegPath : "ffmpeg");
 
   return new Promise((resolve, reject) => {
-    const child = spawn(ffmpegPath, args, { windowsHide: true });
+    const child = spawn(executable, args, { windowsHide: true });
     let stderr = "";
 
     child.stderr.on("data", (chunk) => {
