@@ -1,10 +1,11 @@
 import { createServer } from "node:http";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import dotenv from "dotenv";
+import sharp from "sharp";
 import { renderInvitationOgImage } from "./invitationOgRender.js";
 import { parseImageDataUrl, saveInvitationOgImage } from "./invitationOgStorage.js";
 import { enrichPlace, getPlaceDetails, getPlacePhotoUri, searchNearbyCafes } from "./googlePlaces.js";
@@ -14,8 +15,10 @@ const rootDir = dirname(__dirname);
 dotenv.config({ path: join(rootDir, ".env") });
 const dataDir = join(rootDir, "data");
 const dbPath = join(dataDir, "playbam.sqlite");
+const galleryImagesDir = join(dataDir, "gallery-images");
 
 mkdirSync(dataDir, { recursive: true });
+mkdirSync(galleryImagesDir, { recursive: true });
 
 const db = new DatabaseSync(dbPath);
 db.exec(`
@@ -178,6 +181,16 @@ db.exec(`
     FOREIGN KEY (invitation_id) REFERENCES invitations(id) ON DELETE CASCADE
   );
 
+  CREATE TABLE IF NOT EXISTS invitation_gallery_photos (
+    id TEXT PRIMARY KEY,
+    invitation_id TEXT NOT NULL,
+    image_path TEXT NOT NULL,
+    uploader_name TEXT,
+    status TEXT NOT NULL DEFAULT 'visible' CHECK (status IN ('visible', 'hidden')),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (invitation_id) REFERENCES invitations(id) ON DELETE CASCADE
+  );
+
   CREATE TABLE IF NOT EXISTS auth_otp_codes (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL,
@@ -216,6 +229,8 @@ db.exec(`
     ON invitation_gift_participants (wishlist_item_id);
   CREATE INDEX IF NOT EXISTS idx_invitation_chat_messages_invitation_id
     ON invitation_chat_messages (invitation_id, created_at, id);
+  CREATE INDEX IF NOT EXISTS idx_invitation_gallery_photos_invitation_id
+    ON invitation_gallery_photos (invitation_id, created_at, id);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_gift_reservations_active_item
     ON invitation_gift_reservations (wishlist_item_id)
     WHERE status = 'active';
@@ -515,12 +530,12 @@ function getBearerToken(req) {
   return token;
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let data = "";
     req.on("data", (chunk) => {
       data += chunk;
-      if (data.length > 1024 * 1024) {
+      if (data.length > maxBytes) {
         reject(new Error("Request body too large"));
         req.destroy();
       }
@@ -530,8 +545,8 @@ function readBody(req) {
   });
 }
 
-async function readJsonBody(req) {
-  const rawBody = await readBody(req);
+async function readJsonBody(req, maxBytes) {
+  const rawBody = await readBody(req, maxBytes);
   return rawBody ? JSON.parse(rawBody) : {};
 }
 
@@ -775,6 +790,41 @@ function validateInvitationChatPayload(payload) {
   return { value: { message } };
 }
 
+function parseGalleryImageDataUrl(dataUrl) {
+  const raw = String(dataUrl ?? "").trim();
+  const match = /^data:image\/(jpeg|jpg|png|webp);base64,([A-Za-z0-9+/=]+)$/i.exec(raw);
+  if (!match) {
+    return null;
+  }
+
+  try {
+    return {
+      buffer: Buffer.from(match[2], "base64"),
+      mimeSubtype: match[1].toLowerCase(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function validateGalleryPhotoPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return { error: "Invalid gallery photo payload" };
+  }
+
+  const parsedImage = parseGalleryImageDataUrl(payload.imageDataUrl ?? payload.image);
+  if (!parsedImage || parsedImage.buffer.length < 128) {
+    return { error: "imageDataUrl must be a JPEG, PNG, or WebP data URL" };
+  }
+
+  if (parsedImage.buffer.length > 8 * 1024 * 1024) {
+    return { error: "Gallery image is too large" };
+  }
+
+  const uploaderName = getString(payload.uploaderName).slice(0, 80) || null;
+  return { value: { imageBuffer: parsedImage.buffer, uploaderName } };
+}
+
 function mapInvitationRowToPublic(row) {
   const publicSlug = getInvitationPublicSlug(row);
 
@@ -808,6 +858,89 @@ function mapInvitationRowToPublic(row) {
     webShareUrl: createWebShareUrl(publicSlug),
   };
 }
+
+function getGalleryPhotoPath(invitationId, photoId) {
+  return join(galleryImagesDir, invitationId, `${photoId}.jpg`);
+}
+
+function getGalleryPhotoRelativePath(invitationId, photoId) {
+  return `${invitationId}/${photoId}.jpg`;
+}
+
+function serializeGalleryPhoto(row, invitation) {
+  const publicSlug = getInvitationPublicSlug(invitation);
+  return {
+    id: row.id,
+    invitationId: row.invitation_id,
+    imageUrl: `/api/public/invitations/${encodeURIComponent(publicSlug)}/gallery/${encodeURIComponent(row.id)}.jpg`,
+    uploaderName: row.uploader_name ?? null,
+    createdAt: row.created_at,
+  };
+}
+
+function listGalleryPhotos(invitation) {
+  return db
+    .prepare(
+      `
+        SELECT id, invitation_id, image_path, uploader_name, status, created_at
+        FROM invitation_gallery_photos
+        WHERE invitation_id = ? AND status = 'visible'
+        ORDER BY created_at DESC, id DESC
+      `,
+    )
+    .all(invitation.id)
+    .map((row) => serializeGalleryPhoto(row, invitation));
+}
+
+function getGalleryPhoto(invitationId, photoId) {
+  return (
+    db
+      .prepare(
+        `
+          SELECT id, invitation_id, image_path, uploader_name, status, created_at
+          FROM invitation_gallery_photos
+          WHERE invitation_id = ? AND id = ? AND status = 'visible'
+        `,
+      )
+      .get(invitationId, photoId) ?? null
+  );
+}
+
+async function createGalleryPhoto(invitation, payload) {
+  const photoId = randomId("gallery");
+  const imageDir = join(galleryImagesDir, invitation.id);
+  const imagePath = getGalleryPhotoPath(invitation.id, photoId);
+  const timestamp = nowIso();
+
+  mkdirSync(imageDir, { recursive: true });
+  const jpegBuffer = await sharp(payload.imageBuffer, { failOn: "none" })
+    .rotate()
+    .resize({
+      width: 1600,
+      height: 1600,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .jpeg({ quality: 82, mozjpeg: true })
+    .toBuffer();
+
+  if (jpegBuffer.length > 3 * 1024 * 1024) {
+    throw new Error("GALLERY_IMAGE_TOO_LARGE_AFTER_PROCESSING");
+  }
+
+  writeFileSync(imagePath, jpegBuffer);
+  const relativePath = getGalleryPhotoRelativePath(invitation.id, photoId);
+  db.prepare(
+    `
+      INSERT INTO invitation_gallery_photos (id, invitation_id, image_path, uploader_name, status, created_at)
+      VALUES (?, ?, ?, ?, 'visible', ?)
+    `,
+  ).run(photoId, invitation.id, relativePath, payload.uploaderName, timestamp);
+
+  const row = getGalleryPhoto(invitation.id, photoId);
+  return serializeGalleryPhoto(row, invitation);
+}
+
 function getHostUserByToken(token) {
   if (!token) return null;
   return (
@@ -2343,6 +2476,81 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const publicGalleryImageMatch = pathname.match(/^\/api\/public\/invitations\/([^/]+)\/gallery\/([^/]+)\.jpg$/i);
+    if (req.method === "GET" && publicGalleryImageMatch) {
+      const token = decodeURIComponent(publicGalleryImageMatch[1]);
+      const photoId = decodeURIComponent(publicGalleryImageMatch[2]);
+      const invitation = findInvitationByToken(token);
+      if (!invitation) {
+        json(res, 404, { error: "Invitation not found" });
+        return;
+      }
+
+      const photo = getGalleryPhoto(invitation.id, photoId);
+      if (!photo) {
+        json(res, 404, { error: "Gallery photo not found" });
+        return;
+      }
+
+      const imagePath = getGalleryPhotoPath(invitation.id, photo.id);
+      if (!existsSync(imagePath)) {
+        json(res, 404, { error: "Gallery photo file not found" });
+        return;
+      }
+
+      const image = readFileSync(imagePath);
+      res.writeHead(200, {
+        "Content-Type": "image/jpeg",
+        "Content-Length": String(image.length),
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Access-Control-Allow-Origin": "*",
+      });
+      res.end(image);
+      return;
+    }
+
+    const publicGalleryMatch = pathname.match(/^\/api\/public\/invitations\/([^/]+)\/gallery$/i);
+    if (publicGalleryMatch && req.method === "GET") {
+      const token = decodeURIComponent(publicGalleryMatch[1]);
+      const invitation = findInvitationByToken(token);
+      if (!invitation) {
+        json(res, 404, { error: "Invitation not found" });
+        return;
+      }
+
+      json(res, 200, { photos: listGalleryPhotos(invitation) });
+      return;
+    }
+
+    if (publicGalleryMatch && req.method === "POST") {
+      const token = decodeURIComponent(publicGalleryMatch[1]);
+      const invitation = findInvitationByToken(token);
+      if (!invitation) {
+        json(res, 404, { error: "Invitation not found" });
+        return;
+      }
+
+      const payload = await readJsonBody(req, 12 * 1024 * 1024);
+      const parsed = validateGalleryPhotoPayload(payload);
+      if (parsed.error) {
+        json(res, 400, { error: parsed.error });
+        return;
+      }
+
+      try {
+        const photo = await createGalleryPhoto(invitation, parsed.value);
+        json(res, 201, { photo });
+      } catch (error) {
+        if (String(error?.message ?? error).includes("GALLERY_IMAGE_TOO_LARGE_AFTER_PROCESSING")) {
+          json(res, 400, { error: "Gallery image is too large" });
+          return;
+        }
+        console.error("Gallery upload failed", error);
+        json(res, 400, { error: "Gallery image could not be processed" });
+      }
+      return;
+    }
+
     if (req.method === "GET" && pathname.startsWith("/api/public/invitations/")) {
       const token = decodeURIComponent(pathname.replace("/api/public/invitations/", ""));
       if (!token) {
@@ -3428,6 +3636,11 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     if (error instanceof SyntaxError) {
       json(res, 400, { error: "Invalid JSON body" });
+      return;
+    }
+
+    if (String(error?.message ?? error).includes("Request body too large")) {
+      json(res, 413, { error: "Request body too large" });
       return;
     }
 
