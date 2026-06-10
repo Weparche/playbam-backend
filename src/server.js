@@ -517,7 +517,7 @@ function json(res, status, payload) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Playbam-User-Email, X-Playbam-User-Name",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Playbam-User-Email, X-Playbam-User-Name, X-Playbam-Gallery-Client-Id",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   });
   res.end(JSON.stringify(payload));
@@ -2424,7 +2424,7 @@ const server = createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": getCorsOrigin(req),
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Playbam-User-Email, X-Playbam-User-Name",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Playbam-User-Email, X-Playbam-User-Name, X-Playbam-Gallery-Client-Id",
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
       "Vary": "Origin",
     });
