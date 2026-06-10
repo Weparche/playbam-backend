@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
@@ -265,6 +265,8 @@ ensureColumnExists("invitations", "wishlist_bank_iban", "TEXT");
 ensureColumnExists("invitations", "wishlist_payment_image_url", "TEXT");
 ensureColumnExists("invitations", "rsvp_mood", "TEXT");
 ensureColumnExists("host_users", "app_user_id", "TEXT");
+ensureColumnExists("invitation_gallery_photos", "uploader_client_id", "TEXT");
+ensureColumnExists("invitation_gallery_photos", "uploaded_by_user_id", "TEXT");
 
 /** Postojeće baze: age je bio NOT NULL — omogući NULL i prazno ime. */
 function migrateFamilyChildrenOptionalFields() {
@@ -822,7 +824,8 @@ function validateGalleryPhotoPayload(payload) {
   }
 
   const uploaderName = getString(payload.uploaderName).slice(0, 80) || null;
-  return { value: { imageBuffer: parsedImage.buffer, uploaderName } };
+  const uploaderClientId = getString(payload.uploaderClientId).slice(0, 120) || null;
+  return { value: { imageBuffer: parsedImage.buffer, uploaderName, uploaderClientId } };
 }
 
 function mapInvitationRowToPublic(row) {
@@ -867,7 +870,29 @@ function getGalleryPhotoRelativePath(invitationId, photoId) {
   return `${invitationId}/${photoId}.jpg`;
 }
 
-function serializeGalleryPhoto(row, invitation) {
+function getGalleryUploaderClientIdFromRequest(req, payload) {
+  return getString(req.headers["x-playbam-gallery-client-id"]).slice(0, 120) || payload?.uploaderClientId || null;
+}
+
+function canDeleteGalleryPhoto(req, invitation, photo) {
+  const currentUser = resolveCurrentUser(req);
+  if (currentUser && isHostUser(invitation, currentUser)) {
+    return true;
+  }
+
+  const clientId = getString(req.headers["x-playbam-gallery-client-id"]).slice(0, 120);
+  if (clientId && photo.uploader_client_id && clientId === photo.uploader_client_id) {
+    return true;
+  }
+
+  if (currentUser && photo.uploaded_by_user_id && currentUser.id === photo.uploaded_by_user_id) {
+    return true;
+  }
+
+  return false;
+}
+
+function serializeGalleryPhoto(row, invitation, req) {
   const publicSlug = getInvitationPublicSlug(invitation);
   return {
     id: row.id,
@@ -875,21 +900,22 @@ function serializeGalleryPhoto(row, invitation) {
     imageUrl: `/api/public/invitations/${encodeURIComponent(publicSlug)}/gallery/${encodeURIComponent(row.id)}.jpg`,
     uploaderName: row.uploader_name ?? null,
     createdAt: row.created_at,
+    canDelete: req ? canDeleteGalleryPhoto(req, invitation, row) : false,
   };
 }
 
-function listGalleryPhotos(invitation) {
+function listGalleryPhotos(invitation, req) {
   return db
     .prepare(
       `
-        SELECT id, invitation_id, image_path, uploader_name, status, created_at
+        SELECT id, invitation_id, image_path, uploader_name, uploader_client_id, uploaded_by_user_id, status, created_at
         FROM invitation_gallery_photos
         WHERE invitation_id = ? AND status = 'visible'
         ORDER BY created_at DESC, id DESC
       `,
     )
     .all(invitation.id)
-    .map((row) => serializeGalleryPhoto(row, invitation));
+    .map((row) => serializeGalleryPhoto(row, invitation, req));
 }
 
 function getGalleryPhoto(invitationId, photoId) {
@@ -897,7 +923,7 @@ function getGalleryPhoto(invitationId, photoId) {
     db
       .prepare(
         `
-          SELECT id, invitation_id, image_path, uploader_name, status, created_at
+          SELECT id, invitation_id, image_path, uploader_name, uploader_client_id, uploaded_by_user_id, status, created_at
           FROM invitation_gallery_photos
           WHERE invitation_id = ? AND id = ? AND status = 'visible'
         `,
@@ -906,7 +932,40 @@ function getGalleryPhoto(invitationId, photoId) {
   );
 }
 
-async function createGalleryPhoto(invitation, payload) {
+function getGalleryPhotoRecord(invitationId, photoId) {
+  return (
+    db
+      .prepare(
+        `
+          SELECT id, invitation_id, image_path, uploader_name, uploader_client_id, uploaded_by_user_id, status, created_at
+          FROM invitation_gallery_photos
+          WHERE invitation_id = ? AND id = ?
+        `,
+      )
+      .get(invitationId, photoId) ?? null
+  );
+}
+
+function deleteGalleryPhoto(invitation, photoId) {
+  const photo = getGalleryPhotoRecord(invitation.id, photoId);
+  if (!photo || photo.status !== "visible") {
+    return null;
+  }
+
+  const imagePath = getGalleryPhotoPath(invitation.id, photo.id);
+  if (existsSync(imagePath)) {
+    try {
+      unlinkSync(imagePath);
+    } catch {
+      // ignore missing file races
+    }
+  }
+
+  db.prepare("DELETE FROM invitation_gallery_photos WHERE id = ? AND invitation_id = ?").run(photoId, invitation.id);
+  return photo;
+}
+
+async function createGalleryPhoto(invitation, payload, req) {
   const photoId = randomId("gallery");
   const imageDir = join(galleryImagesDir, invitation.id);
   const imagePath = getGalleryPhotoPath(invitation.id, photoId);
@@ -930,15 +989,35 @@ async function createGalleryPhoto(invitation, payload) {
 
   writeFileSync(imagePath, jpegBuffer);
   const relativePath = getGalleryPhotoRelativePath(invitation.id, photoId);
+  const currentUser = resolveCurrentUser(req);
+  const uploaderClientId = getGalleryUploaderClientIdFromRequest(req, payload);
+  const uploadedByUserId = currentUser?.id ?? null;
   db.prepare(
     `
-      INSERT INTO invitation_gallery_photos (id, invitation_id, image_path, uploader_name, status, created_at)
-      VALUES (?, ?, ?, ?, 'visible', ?)
+      INSERT INTO invitation_gallery_photos (
+        id,
+        invitation_id,
+        image_path,
+        uploader_name,
+        uploader_client_id,
+        uploaded_by_user_id,
+        status,
+        created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, 'visible', ?)
     `,
-  ).run(photoId, invitation.id, relativePath, payload.uploaderName, timestamp);
+  ).run(
+    photoId,
+    invitation.id,
+    relativePath,
+    payload.uploaderName,
+    uploaderClientId,
+    uploadedByUserId,
+    timestamp,
+  );
 
   const row = getGalleryPhoto(invitation.id, photoId);
-  return serializeGalleryPhoto(row, invitation);
+  return serializeGalleryPhoto(row, invitation, req);
 }
 
 function getHostUserByToken(token) {
@@ -2509,6 +2588,32 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const publicGalleryPhotoDeleteMatch = pathname.match(/^\/api\/public\/invitations\/([^/]+)\/gallery\/([^/]+)$/i);
+    if (publicGalleryPhotoDeleteMatch && req.method === "DELETE") {
+      const token = decodeURIComponent(publicGalleryPhotoDeleteMatch[1]);
+      const photoId = decodeURIComponent(publicGalleryPhotoDeleteMatch[2]);
+      const invitation = findInvitationByToken(token);
+      if (!invitation) {
+        json(res, 404, { error: "Invitation not found" });
+        return;
+      }
+
+      const photo = getGalleryPhotoRecord(invitation.id, photoId);
+      if (!photo || photo.status !== "visible") {
+        json(res, 404, { error: "Gallery photo not found" });
+        return;
+      }
+
+      if (!canDeleteGalleryPhoto(req, invitation, photo)) {
+        json(res, 403, { error: "Nemate dozvolu za brisanje ove fotke" });
+        return;
+      }
+
+      deleteGalleryPhoto(invitation, photoId);
+      json(res, 200, { ok: true });
+      return;
+    }
+
     const publicGalleryMatch = pathname.match(/^\/api\/public\/invitations\/([^/]+)\/gallery$/i);
     if (publicGalleryMatch && req.method === "GET") {
       const token = decodeURIComponent(publicGalleryMatch[1]);
@@ -2518,7 +2623,7 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      json(res, 200, { photos: listGalleryPhotos(invitation) });
+      json(res, 200, { photos: listGalleryPhotos(invitation, req) });
       return;
     }
 
@@ -2538,7 +2643,7 @@ const server = createServer(async (req, res) => {
       }
 
       try {
-        const photo = await createGalleryPhoto(invitation, parsed.value);
+        const photo = await createGalleryPhoto(invitation, parsed.value, req);
         json(res, 201, { photo });
       } catch (error) {
         if (String(error?.message ?? error).includes("GALLERY_IMAGE_TOO_LARGE_AFTER_PROCESSING")) {
